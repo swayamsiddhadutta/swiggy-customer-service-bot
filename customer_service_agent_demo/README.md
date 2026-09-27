@@ -32,6 +32,15 @@ python3 -m pip install -r customer_service_agent_demo/requirements.txt
 python3 customer_service_agent_demo/customer_service_agent_langgraph.py --reset-db
 ```
 
+Or use the included setup helper which creates a virtualenv and installs
+dependencies:
+
+```bash
+python3 customer_service_agent_demo/setup_env.py
+source .venv/bin/activate
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py --reset-db
+```
+
 Run only final answers from the LangGraph version:
 
 ```bash
@@ -94,3 +103,121 @@ if pending_tool_call     conditional edge reason -> act/end
 
 The LangGraph demo still uses deterministic local planning instead of a real
 LLM so it can run without an API key.
+
+## Real LLM Mode
+
+The LangGraph demo has two planner modes:
+
+```text
+deterministic  local rule-based planner for repeatable tests
+llm            real OpenAI-compatible tool-calling model
+```
+
+The production-shaped design is:
+
+```text
+LangGraph graph
+  reason node
+    deterministic planner OR OpenAI-compatible LLM gateway
+  act node
+    normalizes system-owned fields
+    enforces guardrails
+    executes backend tools
+
+Swiggy-like SQLite backend
+  customers
+  customer_addresses
+  restaurants
+  menu_items
+  delivery_partners
+  orders
+  order_items
+  order_status_events
+  payments
+  support_contacts
+  refunds
+  escalation_tickets
+  audit_log
+
+Provider gateway
+  xAI / Grok directly
+  OpenRouter
+  LiteLLM proxy
+  any OpenAI-compatible endpoint
+```
+
+The key production idea is that provider replacement should happen in config,
+not across the graph and tools. The code uses `llm_gateway.py` as a small
+OpenAI-compatible adapter so the graph does not care whether the model is Grok,
+OpenRouter, LiteLLM, or another compatible endpoint.
+
+### xAI / Grok
+
+```bash
+export AGENT_LLM_PROVIDER=xai
+export AGENT_LLM_MODEL=grok-4.7
+export XAI_API_KEY=your_xai_key
+
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py \
+  --reset-db \
+  --planner llm \
+  --scenario 1
+```
+
+### OpenRouter
+
+Use this when you want one hosted API key for many model providers and are okay
+with an external gateway.
+
+```bash
+export AGENT_LLM_PROVIDER=openrouter
+export AGENT_LLM_MODEL=replace-with-openrouter-model-slug
+export OPENROUTER_API_KEY=your_openrouter_key
+
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py \
+  --reset-db \
+  --planner llm \
+  --scenario 1
+```
+
+### LiteLLM
+
+Use this when you want a company-style internal gateway with model aliases,
+fallbacks, budgets, logging, and one OpenAI-compatible endpoint for apps.
+
+```bash
+export AGENT_LLM_PROVIDER=litellm
+export AGENT_LLM_BASE_URL=http://localhost:4000/v1
+export AGENT_LLM_MODEL=swiggy-support-primary
+export LITELLM_API_KEY=your_litellm_proxy_key
+
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py \
+  --reset-db \
+  --planner llm \
+  --scenario 1
+```
+
+### Generic OpenAI-Compatible Provider
+
+```bash
+export AGENT_LLM_PROVIDER=openai-compatible
+export AGENT_LLM_BASE_URL=https://provider.example.com/v1
+export AGENT_LLM_MODEL=provider-model-name
+export AGENT_LLM_API_KEY_ENV=LLM_API_KEY
+export LLM_API_KEY=your_provider_key
+
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py \
+  --reset-db \
+  --planner llm \
+  --scenario 1
+```
+
+You can also run a custom request:
+
+```bash
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py \
+  --planner llm \
+  --customer-id CUST-2 \
+  --order-id ORD-202 \
+  --message "My coke was missing. Please refund it."
+```
