@@ -23,6 +23,78 @@
             "justMyCode": false
         },
         {
+            "name": "Agent: LLM scenario 2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/customer_service_agent_demo/customer_service_agent_langgraph.py",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/customer_service_agent_demo/.env",
+            "args": [
+                "--reset-db",
+                "--planner",
+                "llm",
+                "--scenario",
+                "2"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Agent: LLM scenario 3",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/customer_service_agent_demo/customer_service_agent_langgraph.py",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/customer_service_agent_demo/.env",
+            "args": [
+                "--reset-db",
+                "--planner",
+                "llm",
+                "--scenario",
+                "3"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Agent: LLM scenario 4",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/customer_service_agent_demo/customer_service_agent_langgraph.py",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/customer_service_agent_demo/.env",
+            "args": [
+                "--reset-db",
+                "--planner",
+                "llm",
+                "--scenario",
+                "4"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Agent: LLM scenario 5",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/customer_service_agent_demo/customer_service_agent_langgraph.py",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/customer_service_agent_demo/.env",
+            "args": [
+                "--reset-db",
+                "--planner",
+                "llm",
+                "--scenario",
+                "5"
+            ],
+            "justMyCode": false
+        },
+        {
             "name": "Agent: deterministic all scenarios",
             "type": "debugpy",
             "request": "launch",
