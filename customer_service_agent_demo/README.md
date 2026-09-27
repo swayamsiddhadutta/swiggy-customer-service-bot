@@ -25,6 +25,19 @@ Run only final answers:
 python3 customer_service_agent_demo/customer_service_agent.py --reset-db --quiet
 ```
 
+Run the LangGraph version:
+
+```bash
+python3 -m pip install -r customer_service_agent_demo/requirements.txt
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py --reset-db
+```
+
+Run only final answers from the LangGraph version:
+
+```bash
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py --reset-db --quiet
+```
+
 Show the standard real LLM setup:
 
 ```bash
@@ -62,3 +75,22 @@ That returned dictionary is a partial state update. In LangGraph, the reducer fo
 The purpose is to make the loop, state updates, function inputs/outputs, and
 guardrails inspectable. A real LLM would make the tool choices dynamically, but
 that requires provider credentials and installed LangChain/LangGraph packages.
+
+## LangGraph Version
+
+`customer_service_agent_langgraph.py` implements the same five scenarios with
+`StateGraph`.
+
+The mapping is:
+
+```text
+Plain Python demo        LangGraph demo
+run_agent while-loop     StateGraph edges
+reason_node              graph node: reason
+act_node                 graph node: act
+merge_state_update       LangGraph reducers
+if pending_tool_call     conditional edge reason -> act/end
+```
+
+The LangGraph demo still uses deterministic local planning instead of a real
+LLM so it can run without an API key.
