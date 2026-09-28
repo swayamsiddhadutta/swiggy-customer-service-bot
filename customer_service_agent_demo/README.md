@@ -13,6 +13,9 @@ It shows:
   escalation evidence, and max loop steps.
 - Five simulated scenarios.
 
+See `PRODUCTION_AGENT_PLAN.md` for the production roadmap covering policy
+tools, RAG, guardrails, human review, observability, and evals.
+
 Run it:
 
 ```bash
