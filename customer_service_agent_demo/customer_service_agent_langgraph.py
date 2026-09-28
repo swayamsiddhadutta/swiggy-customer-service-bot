@@ -19,6 +19,7 @@ import copy
 import json
 import os
 import operator
+import uuid
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 import os as _os
@@ -66,6 +67,9 @@ def merge_dict(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
 
 
 class CustomerServiceState(TypedDict, total=False):
+    run_id: str
+    case_id: str | None
+    planner: str
     customer_id: str
     order_id: str | None
     user_message: str
@@ -420,7 +424,10 @@ def make_reason_node(
             update["final_answer"] = str(response["content"])
 
         trace_event = {
+            "run_id": state.get("run_id"),
+            "case_id": state.get("case_id"),
             "node": "reason",
+            "reason_step": next_reason_steps,
             "input": node_input,
             "output": snapshot(update),
         }
@@ -555,7 +562,10 @@ def act_node(state: CustomerServiceState) -> dict[str, Any]:
         "pending_tool_call": None,
     }
     trace_event = {
+        "run_id": state.get("run_id"),
+        "case_id": state.get("case_id"),
         "node": "act",
+        "reason_step": state.get("reason_steps", 0),
         "input": node_input,
         "guardrail": snapshot(guardrail),
         "output": snapshot(update),
@@ -593,8 +603,14 @@ def initial_state(
     customer_id: str,
     order_id: str | None,
     user_message: str,
+    planner: Literal["deterministic", "llm"] = "deterministic",
+    case_id: str | None = None,
+    run_id: str | None = None,
 ) -> CustomerServiceState:
     return {
+        "run_id": run_id or str(uuid.uuid4()),
+        "case_id": case_id,
+        "planner": planner,
         "customer_id": customer_id,
         "order_id": order_id,
         "user_message": user_message,
@@ -614,10 +630,19 @@ def run_agent(
     verbose: bool,
     planner: Literal["deterministic", "llm"] = "deterministic",
     llm_client: OpenAICompatibleToolCallingClient | None = None,
+    case_id: str | None = None,
+    run_id: str | None = None,
 ) -> CustomerServiceState:
     app = build_graph(planner=planner, llm_client=llm_client)
     final_state = app.invoke(
-        initial_state(customer_id, order_id, user_message),
+        initial_state(
+            customer_id,
+            order_id,
+            user_message,
+            planner=planner,
+            case_id=case_id,
+            run_id=run_id,
+        ),
         config={"recursion_limit": 20},
     )
 
@@ -625,6 +650,79 @@ def run_agent(
         print_trace(final_state)
 
     return final_state
+
+
+def tool_sequence(state: CustomerServiceState) -> list[str]:
+    tools = []
+    for event in state.get("trace", []):
+        if event.get("node") != "act":
+            continue
+        output = event.get("output", {})
+        for message in output.get("messages", []):
+            tool_name = message.get("tool_name")
+            if tool_name:
+                tools.append(tool_name)
+    return tools
+
+
+def derive_reason_codes(state: CustomerServiceState) -> list[str]:
+    facts = state.get("facts", {})
+    reason_codes: list[str] = []
+
+    refund_policy = facts.get("check_refund_eligibility")
+    if refund_policy:
+        reason = refund_policy.get("reason")
+        if reason:
+            reason_codes.append(str(reason))
+
+    history = facts.get("get_order_history")
+    if history and history.get("prior_support_contacts", 0) >= 2:
+        reason_codes.append("repeat_support_contacts")
+
+    payments = facts.get("check_payment_transactions")
+    if payments and payments.get("duplicate_charge_likely"):
+        reason_codes.append("duplicate_charge_likely")
+
+    status = facts.get("get_order_status")
+    user_text = state.get("user_message", "").lower()
+    if status and "cancel" in user_text:
+        if status.get("cancellable"):
+            reason_codes.append("cancellable")
+        elif "cancellable" in status:
+            reason_codes.append("order_not_cancellable")
+
+    return reason_codes
+
+
+def escalation_team(state: CustomerServiceState) -> str | None:
+    ticket = state.get("facts", {}).get("create_escalation_ticket")
+    if not ticket:
+        return None
+    return ticket.get("team")
+
+
+def normalized_run_trace(state: CustomerServiceState) -> dict[str, Any]:
+    return {
+        "run_id": state.get("run_id"),
+        "case_id": state.get("case_id"),
+        "customer_id": state.get("customer_id"),
+        "order_id": state.get("order_id"),
+        "message": state.get("user_message"),
+        "planner": state.get("planner"),
+        "tool_sequence": tool_sequence(state),
+        "reason_codes": derive_reason_codes(state),
+        "escalation_team": escalation_team(state),
+        "final_answer": state.get("final_answer"),
+        "reason_steps": state.get("reason_steps"),
+        "trace_event_count": len(state.get("trace", [])),
+    }
+
+
+def write_run_traces(path: Path, states: list[CustomerServiceState]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for state in states:
+            handle.write(json.dumps(normalized_run_trace(state), sort_keys=True) + "\n")
 
 
 def print_trace(state: CustomerServiceState) -> None:
@@ -652,7 +750,8 @@ def run_scenarios(
     planner: Literal["deterministic", "llm"],
     llm_client: OpenAICompatibleToolCallingClient | None,
     scenario_number: int | None,
-) -> None:
+) -> list[CustomerServiceState]:
+    states = []
     for scenario in selected_scenarios(scenario_number):
         print(f"\n{'=' * 80}")
         print(scenario["name"])
@@ -664,8 +763,11 @@ def run_scenarios(
             verbose=verbose,
             planner=planner,
             llm_client=llm_client,
+            case_id=scenario["name"],
         )
+        states.append(state)
         print(f"\nFINAL: {state.get('final_answer')}")
+    return states
 
 
 def print_real_llm_note() -> None:
@@ -700,6 +802,8 @@ def main() -> None:
     parser.add_argument("--customer-id", help="Run a custom single request for this customer.")
     parser.add_argument("--order-id", help="Run a custom single request for this order.")
     parser.add_argument("--message", help="Run a custom single user message.")
+    parser.add_argument("--case-id", help="Optional eval case ID for trace output.")
+    parser.add_argument("--trace-output", type=Path, help="Write normalized local run traces as JSONL.")
     args = parser.parse_args()
 
     if args.reset_db or not Path(DB_PATH).exists():
@@ -730,15 +834,21 @@ def main() -> None:
             verbose=not args.quiet,
             planner=args.planner,
             llm_client=llm_client,
+            case_id=args.case_id,
         )
         print(f"\nFINAL: {state.get('final_answer')}")
+        states = [state]
     else:
-        run_scenarios(
+        states = run_scenarios(
             verbose=not args.quiet,
             planner=args.planner,
             llm_client=llm_client,
             scenario_number=args.scenario,
         )
+
+    if args.trace_output:
+        write_run_traces(args.trace_output, states)
+        print(f"\nTRACE_OUTPUT: {args.trace_output}")
 
 
 if __name__ == "__main__":

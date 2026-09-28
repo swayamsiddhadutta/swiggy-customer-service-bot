@@ -108,6 +108,37 @@
             "justMyCode": false
         },
         {
+            "name": "Agent: local evals",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/customer_service_agent_demo/evals/run_local_evals.py",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "args": [
+                "--trace-output",
+                ".context/local_eval_traces.jsonl"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Agent: local evals (LLM)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/customer_service_agent_demo/evals/run_local_evals.py",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/customer_service_agent_demo/.env",
+            "args": [
+                "--planner",
+                "llm",
+                "--trace-output",
+                ".context/local_eval_traces_llm.jsonl"
+            ],
+            "justMyCode": false
+        },
+        {
             "name": "Python Debugger: Current File with Arguments",
             "type": "debugpy",
             "request": "launch",

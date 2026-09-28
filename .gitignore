@@ -1,5 +1,8 @@
 .DS_Store
 
+# Local workspace/context artifacts
+.context/
+
 # Local Python environments and caches
 .venv/
 venv/
