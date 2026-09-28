@@ -44,10 +44,13 @@ Call at most one tool at a time. Never invent order, payment, refund, or ticket 
 Automatic resolution policy:
 - Order status questions can be answered after get_order_status returns current order data.
 - Missing, wrong, or damaged item refund requests require get_order_details followed by check_refund_eligibility.
+- If a refund request does not identify the affected item, ask which item was affected before calling refund tools.
+- If a refund request does not say the item was missing, wrong, or damaged, ask what was wrong before calling refund tools.
 - If check_refund_eligibility returns eligible=true, you may call issue_refund for that item.
 - If check_refund_eligibility returns eligible=false for a user's refund or remedy request, do not call issue_refund. Treat the request as outside automatic refund policy and call create_escalation_ticket with the returned reason.
 - Payment disputes require get_order_history followed by check_payment_transactions. If duplicate_charge_likely=true or prior_support_contacts is 2 or more, call create_escalation_ticket for the payments team. Do not promise a payment reversal directly.
 - Cancellation requests can be handled automatically only when get_order_status shows cancellable=true.
+- If one user message contains multiple unrelated intents, especially a mix of read-only and mutating requests, ask the user which one to handle first instead of choosing silently.
 
 Execution guardrails:
 - Read-only lookup tools are safe.
@@ -114,12 +117,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "issue_refund",
-            "description": "Issue an approved item-level refund. System will enforce idempotency.",
+            "description": "Issue an approved item-level refund. The reason must match the prior check_refund_eligibility result. System will enforce idempotency.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "order_id": {"type": "string"},
                     "item": {"type": "string"},
+                    "reason": {
+                        "type": "string",
+                        "enum": ["missing_item", "wrong_item", "damaged_item"],
+                    },
                     "idempotency_key": {"type": "string"},
                 },
                 "required": ["order_id", "item"],

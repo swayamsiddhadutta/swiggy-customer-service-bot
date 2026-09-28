@@ -119,6 +119,13 @@ def choose_next_message(state: CustomerServiceState) -> Message:
             },
         }
 
+    intents = detected_intents(user_text)
+    if len(intents) > 1:
+        return {
+            "role": "assistant",
+            "content": "I can handle one request at a time. Do you want me to check the order status or cancel the order?",
+        }
+
     if "where" in user_text or "status" in user_text:
         return choose_order_status_message(state, facts)
 
@@ -153,6 +160,36 @@ def forced_step_cap_message(state: CustomerServiceState) -> Message:
             },
         },
     }
+
+
+def detect_refund_reason(user_text: str) -> Literal["missing_item", "wrong_item", "damaged_item"] | None:
+    if (
+        "missing" in user_text
+        or "without the" in user_text
+        or "without my" in user_text
+        or "did not receive" in user_text
+        or "never got" in user_text
+        or "not delivered" in user_text
+    ):
+        return "missing_item"
+    if "wrong" in user_text:
+        return "wrong_item"
+    if "damaged" in user_text or "spoiled" in user_text or "leaked" in user_text:
+        return "damaged_item"
+    return None
+
+
+def detected_intents(user_text: str) -> list[str]:
+    intents = []
+    if "where" in user_text or "status" in user_text:
+        intents.append("status")
+    if "missing" in user_text or "refund" in user_text or "wrong" in user_text or "damaged" in user_text:
+        intents.append("refund")
+    if "charged twice" in user_text or "double charged" in user_text:
+        intents.append("payment_dispute")
+    if "cancel" in user_text:
+        intents.append("cancel")
+    return intents
 
 
 def choose_order_status_message(
@@ -191,6 +228,17 @@ def choose_refund_message(
     user_text: str,
 ) -> Message:
     item = detect_item(user_text)
+    refund_reason = detect_refund_reason(user_text)
+    if item is None:
+        return {
+            "role": "assistant",
+            "content": "Which item was missing from your order?",
+        }
+    if refund_reason is None:
+        return {
+            "role": "assistant",
+            "content": "What was wrong with the item: was it missing, wrong, or damaged?",
+        }
 
     if "get_order_details" not in facts:
         return {
@@ -211,7 +259,7 @@ def choose_refund_message(
                 "args": {
                     "order_id": state.get("order_id"),
                     "item": item,
-                    "reason": "missing_item",
+                    "reason": refund_reason,
                 },
             },
         }
@@ -261,25 +309,28 @@ def choose_refund_message(
                 "args": {
                     "order_id": state.get("order_id"),
                     "item": item,
-                    "idempotency_key": f"refund-{state.get('order_id')}-{item}",
+                    "reason": refund_reason,
+                    "idempotency_key": f"refund-{state.get('order_id')}-{item}-{refund_reason}",
                 },
             },
         }
 
     refund = facts["issue_refund"]
     if refund.get("duplicate_request"):
+        reason_label = refund_reason.replace("_item", "").replace("_", " ")
         return {
             "role": "assistant",
             "content": (
-                f"A refund of Rs {refund['amount']} for the missing {item} "
+                f"A refund of Rs {refund['amount']} for the {reason_label} {item} "
                 "has already been created for this request."
             ),
         }
 
+    reason_label = refund_reason.replace("_item", "").replace("_", " ")
     return {
         "role": "assistant",
         "content": (
-            f"I refunded Rs {refund['amount']} for the missing {item}. "
+            f"I refunded Rs {refund['amount']} for the {reason_label} {item}. "
             f"It should reflect in {refund['eta']}."
         ),
     }
@@ -457,6 +508,8 @@ def guardrails_for_tool_call(
             eligibility = state.get("facts", {}).get("check_refund_eligibility")
             if not eligibility or not eligibility.get("eligible"):
                 return {"allow": False, "reason": "refund_not_preapproved"}
+            if args.get("reason") != eligibility.get("reason"):
+                return {"allow": False, "reason": "refund_reason_mismatch"}
 
         if name == "create_escalation_ticket":
             if not args.get("reasoning") or not args.get("trace"):
@@ -476,8 +529,12 @@ def normalize_tool_call(state: CustomerServiceState, tool_call: ToolCall) -> Too
     }
     args = normalized["args"]
 
+    if normalized["name"] == "issue_refund" and not args.get("reason"):
+        eligibility = state.get("facts", {}).get("check_refund_eligibility") or {}
+        args["reason"] = eligibility.get("reason", "missing_item")
+
     if normalized["name"] == "issue_refund" and not args.get("idempotency_key"):
-        args["idempotency_key"] = f"refund-{args.get('order_id')}-{args.get('item')}"
+        args["idempotency_key"] = f"refund-{args.get('order_id')}-{args.get('item')}-{args.get('reason')}"
 
     if normalized["name"] == "cancel_order" and not args.get("idempotency_key"):
         args["idempotency_key"] = f"cancel-{args.get('order_id')}"

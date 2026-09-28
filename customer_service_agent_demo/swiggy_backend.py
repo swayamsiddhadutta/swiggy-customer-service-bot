@@ -383,11 +383,11 @@ def init_db(db_path: Path = DB_PATH) -> None:
     conn.close()
 
 
-def detect_item(user_text: str) -> str:
+def detect_item(user_text: str) -> str | None:
     for item in ["garlic bread", "filter coffee", "paneer roll", "biryani", "burger", "coke", "pizza", "dosa", "coffee"]:
         if item in user_text.lower():
             return "filter coffee" if item == "coffee" else item
-    return "coke"
+    return None
 
 
 def get_order_status(order_id: str, db_path: Path = DB_PATH) -> dict[str, Any]:
@@ -549,10 +549,11 @@ def issue_refund(
     order_id: str,
     item: str,
     idempotency_key: str,
+    reason: str = "missing_item",
     db_path: Path = DB_PATH,
 ) -> dict[str, Any]:
     """Issue an item-level refund after policy approval."""
-    eligibility = check_refund_eligibility(order_id, item, "missing_item", db_path)
+    eligibility = check_refund_eligibility(order_id, item, reason, db_path)
     if not eligibility.get("eligible"):
         return {
             "ok": False,
@@ -564,7 +565,7 @@ def issue_refund(
     with connect(db_path) as conn:
         existing = row_to_dict(
             conn.execute(
-                "SELECT refund_id, status, amount FROM refunds WHERE idempotency_key = ?",
+                "SELECT refund_id, status, amount, reason FROM refunds WHERE idempotency_key = ?",
                 (idempotency_key,),
             ).fetchone()
         )
@@ -581,7 +582,7 @@ def issue_refund(
                 order_id,
                 eligibility["item"],
                 eligibility["refund_amount"],
-                "missing_item",
+                reason,
                 idempotency_key,
                 "success",
             ),
@@ -594,6 +595,7 @@ def issue_refund(
                 "order_id": order_id,
                 "item": eligibility["item"],
                 "amount": eligibility["refund_amount"],
+                "reason": reason,
                 "idempotency_key": idempotency_key,
             },
         )
@@ -604,6 +606,7 @@ def issue_refund(
         "refund_id": refund_id,
         "status": "success",
         "amount": eligibility["refund_amount"],
+        "reason": reason,
         "eta": "3-5 business days",
     }
 
