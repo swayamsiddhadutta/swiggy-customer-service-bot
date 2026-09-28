@@ -1,0 +1,4 @@
+__pycache__/
+*.sqlite
+.DS_Store
+.env

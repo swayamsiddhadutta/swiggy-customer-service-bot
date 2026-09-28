@@ -1,0 +1,13 @@
+.DS_Store
+
+# Local Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Local demo/runtime artifacts
+*.sqlite
+*.sqlite3
+.env
