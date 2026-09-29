@@ -19,6 +19,7 @@ import copy
 import json
 import os
 import operator
+import re
 import uuid
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
@@ -190,6 +191,25 @@ def detected_intents(user_text: str) -> list[str]:
     if "cancel" in user_text:
         intents.append("cancel")
     return intents
+
+
+def normalize_for_match(value: Any) -> str:
+    text = str(value or "").lower().replace("_", " ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def refund_item_was_user_specified(state: CustomerServiceState, item: Any) -> bool:
+    normalized_item = normalize_for_match(item)
+    normalized_message = normalize_for_match(state.get("user_message", ""))
+    if not normalized_item:
+        return False
+    if normalized_item in normalized_message:
+        return True
+    aliases = {
+        "filter coffee": {"coffee"},
+    }
+    return any(alias in normalized_message for alias in aliases.get(normalized_item, set()))
 
 
 def choose_order_status_message(
@@ -496,6 +516,10 @@ def guardrails_for_tool_call(
 
     if name not in TOOLS:
         return {"allow": False, "reason": "tool_not_allowlisted"}
+
+    if name in {"check_refund_eligibility", "issue_refund"}:
+        if not refund_item_was_user_specified(state, args.get("item")):
+            return {"allow": False, "reason": "refund_item_not_specified_by_user"}
 
     if name in READ_ONLY_TOOLS:
         return {"allow": True, "risk": "read_only"}
