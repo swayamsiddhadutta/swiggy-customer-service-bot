@@ -21,6 +21,7 @@ import os
 import operator
 import re
 import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 import os as _os
@@ -43,9 +44,9 @@ from swiggy_backend import (
     READ_ONLY_TOOLS,
     SCENARIOS,
     TOOLS,
-    detect_item,
     init_db,
     pretty,
+    resolve_item_mention,
 )
 
 
@@ -199,17 +200,57 @@ def normalize_for_match(value: Any) -> str:
     return " ".join(text.split())
 
 
-def refund_item_was_user_specified(state: CustomerServiceState, item: Any) -> bool:
+def phrase_similarity(left: str, right: str) -> float:
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def candidate_phrases(words: list[str], max_length: int) -> list[str]:
+    phrases = []
+    for size in range(1, max_length + 1):
+        for start in range(0, len(words) - size + 1):
+            phrases.append(" ".join(words[start : start + size]))
+    return phrases
+
+
+def resolve_refund_item_mention(state: CustomerServiceState, item: Any) -> dict[str, Any]:
     normalized_item = normalize_for_match(item)
     normalized_message = normalize_for_match(state.get("user_message", ""))
     if not normalized_item:
-        return False
+        return {"decision": "block", "method": "empty_item", "confidence": 0}
     if normalized_item in normalized_message:
-        return True
+        return {"decision": "allow", "method": "exact", "confidence": 1}
+
     aliases = {
         "filter coffee": {"coffee"},
     }
-    return any(alias in normalized_message for alias in aliases.get(normalized_item, set()))
+    for alias in aliases.get(normalized_item, set()):
+        if alias in normalized_message:
+            return {"decision": "allow", "method": "alias", "confidence": 1, "alias": alias}
+
+    item_word_count = len(normalized_item.split())
+    best_phrase = ""
+    best_score = 0.0
+    for phrase in candidate_phrases(normalized_message.split(), max(item_word_count + 1, 1)):
+        score = phrase_similarity(normalized_item, phrase)
+        if score > best_score:
+            best_score = score
+            best_phrase = phrase
+
+    if best_score >= 0.84:
+        return {
+            "decision": "confirm",
+            "suggested_item": item,
+            "method": "fuzzy",
+            "confidence": round(best_score, 3),
+            "matched_text": best_phrase,
+        }
+
+    return {
+        "decision": "block",
+        "method": "none",
+        "confidence": round(best_score, 3),
+        "best_match": best_phrase,
+    }
 
 
 def choose_order_status_message(
@@ -247,8 +288,15 @@ def choose_refund_message(
     facts: dict[str, Any],
     user_text: str,
 ) -> Message:
-    item = detect_item(user_text)
+    item_resolution = resolve_item_mention(user_text)
+    item = item_resolution.get("item") if item_resolution["decision"] == "allow" else None
     refund_reason = detect_refund_reason(user_text)
+    if item_resolution["decision"] == "confirm":
+        suggested_item = item_resolution["suggested_item"]
+        return {
+            "role": "assistant",
+            "content": f"Did you mean {suggested_item} was the item affected in your order?",
+        }
     if item is None:
         return {
             "role": "assistant",
@@ -518,8 +566,16 @@ def guardrails_for_tool_call(
         return {"allow": False, "reason": "tool_not_allowlisted"}
 
     if name in {"check_refund_eligibility", "issue_refund"}:
-        if not refund_item_was_user_specified(state, args.get("item")):
-            return {"allow": False, "reason": "refund_item_not_specified_by_user"}
+        resolution = resolve_refund_item_mention(state, args.get("item"))
+        if resolution["decision"] != "allow":
+            reason = "refund_item_needs_confirmation"
+            if resolution["decision"] == "block":
+                reason = "refund_item_not_specified_by_user"
+            return {
+                "allow": False,
+                "reason": reason,
+                "resolution": resolution,
+            }
 
     if name in READ_ONLY_TOOLS:
         return {"allow": True, "risk": "read_only"}

@@ -45,6 +45,7 @@ Automatic resolution policy:
 - Order status questions can be answered after get_order_status returns current order data.
 - Missing, wrong, or damaged item refund requests require get_order_details followed by check_refund_eligibility.
 - If a refund request does not identify the affected item, ask which item was affected before calling refund tools.
+- If the affected item appears to be a typo or fuzzy match, ask the user to confirm the likely item before calling refund tools.
 - If a refund request does not say the item was missing, wrong, or damaged, ask what was wrong before calling refund tools.
 - If check_refund_eligibility returns eligible=true, you may call issue_refund for that item.
 - If check_refund_eligibility returns eligible=false for a user's refund or remedy request, do not call issue_refund. Treat the request as outside automatic refund policy and call create_escalation_ticket with the returned reason.
