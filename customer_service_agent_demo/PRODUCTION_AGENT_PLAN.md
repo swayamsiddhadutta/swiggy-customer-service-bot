@@ -88,7 +88,54 @@ These tools should return structured decisions:
 
 The LLM should treat this decision packet as authoritative.
 
-### 4. RAG Over Policy Docs
+### 4. Refund Related Deterministic Code
+
+Refund automation should not depend on the LLM proving that an item was truly
+missing, wrong, or damaged. In food delivery, low-value refunds are usually a
+risk-based business decision: verifying the physical truth of every claim can
+cost more than the average refund or fraud loss.
+
+The deterministic refund layer should therefore answer different questions:
+
+- Is the claim grounded in a real item from this real order?
+- Is the requested reason supported by automatic policy?
+- Is the order delivered and inside the refund window?
+- Is the refund amount below the automatic threshold?
+- Is the customer, restaurant, item, or order risk acceptable?
+- Has this item/order already been refunded?
+
+This keeps deterministic code focused on policy and risk, not on rebuilding a
+fragile phrase-understanding system beside the LLM. Phrase checks such as exact
+item mention, aliases, fuzzy typos, or complementary wording are useful only as
+lightweight grounding signals. They should not grow into the main intelligence
+of the agent.
+
+Useful concrete policy signals include:
+
+- Customer refund history and recent support contacts.
+- Restaurant missing-item or wrong-item rate over recent windows.
+- Item category, such as drinks or sides that are commonly missed.
+- Refund amount and order value.
+- Delivery status, delivery age, and refund window.
+- Duplicate refund attempts for the same order and item.
+
+The preferred production pattern is:
+
+```text
+LLM extracts the customer claim
+  -> deterministic policy checks order, item, reason, risk, and thresholds
+  -> low-risk grounded claims are auto-approved
+  -> unclear extraction asks for clarification
+  -> high-risk or outside-policy claims escalate
+```
+
+Clarification should be reserved for cases where grounding fails or conflicts:
+the item is not in the order, multiple items are plausible, the reason is
+missing, extraction methods disagree, or risk thresholds require human review.
+We should avoid asking for confirmation on every refund because that degrades
+the agent experience without adding meaningful policy certainty.
+
+### 5. RAG Over Policy Docs
 
 RAG is useful, but it should not be the only thing deciding consequential
 actions.
@@ -111,7 +158,7 @@ Do not rely only on RAG for:
 For these actions, RAG can provide context, but deterministic policy tools
 should return the final action decision.
 
-### 5. Guarded Mutating Tools
+### 6. Guarded Mutating Tools
 
 Mutating tools should verify that a policy decision exists in state before they
 run.
@@ -133,7 +180,7 @@ All mutating tools should use:
 - Policy version or policy reference.
 - Tool-call trace.
 
-### 6. Human In The Loop
+### 7. Human In The Loop
 
 Escalate or pause for human review when:
 
