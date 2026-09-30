@@ -184,6 +184,80 @@ Policy decides:
 The LLM can perform useful extraction. Code should decide whether the extraction
 is grounded and low-risk enough to act on.
 
+## One Tool At A Time Is A Safety And State Choice
+
+The current agent asks the LLM to call at most one tool at a time. This matches
+the graph state shape: each reasoning step produces one `pending_tool_call`,
+then the `act` node executes it, stores the result, and the next reasoning step
+can use that result.
+
+This is especially important when tools depend on each other:
+
+```text
+get_order_details
+  -> check_refund_eligibility
+  -> issue_refund
+```
+
+The model should not call `check_refund_eligibility` or `issue_refund` before it
+has seen the earlier tool result in state.
+
+However, many tool-calling APIs can return multiple tool calls in a single LLM
+message. The current demo adapter keeps only the first returned tool call. That
+is simple, but it should not be the production behavior because silently
+dropping extra calls can hide model mistakes.
+
+Production options:
+
+- Reject the model response and retry with an instruction to return one tool.
+- Record a guardrail violation when multiple calls are returned.
+- Allow multiple calls only for explicitly safe, independent, read-only tools.
+- Execute allowed parallel calls in a dedicated fan-out/fan-in graph node.
+
+Multiple tool calls are desirable only when calls are independent and safe to
+parallelize. They are risky when one call depends on another result, or when any
+call mutates business state.
+
+## Parallel Versus Sequential Work Should Be Graph-Owned
+
+For multi-intent requests, the graph should control which work can run in
+parallel and which work must remain sequential. The LLM can help decompose the
+user request, but code should decide execution order based on tool metadata,
+dependencies, and risk.
+
+Recommended shape:
+
+```text
+decompose_or_route
+  -> validate_intents_and_risk
+  -> plan_execution
+  -> parallel read-only branches when independent
+  -> sequential workflow branches when dependent
+  -> join_results
+  -> final_response
+```
+
+Examples:
+
+- Status lookup and order-history lookup can run in parallel when both are
+  read-only and independent.
+- Payment-dispute checking may start with order history, but
+  `check_payment_transactions` must wait for the order IDs returned by
+  `get_order_history`.
+- Refund workflows should remain sequential or hidden behind a higher-level
+  policy tool because eligibility and mutation depend on earlier facts.
+- Multiple mutating intents, such as cancel plus refund, should usually ask the
+  user which action to handle first unless a deterministic policy explicitly
+  allows a sequence.
+
+The production rule is:
+
+```text
+Parallelize independent read-only branches.
+Keep dependent work inside sequential subflows.
+Do not parallelize mutating business actions without explicit policy approval.
+```
+
 ## Evals Are How We Notice Architecture Pressure
 
 Routing, separate prompts, and specialized subgraphs should not be added only

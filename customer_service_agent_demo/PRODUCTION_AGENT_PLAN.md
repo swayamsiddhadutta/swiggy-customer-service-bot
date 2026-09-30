@@ -241,6 +241,11 @@ Status: in progress.
 - List read-only tools, policy decision tools, and mutating tools.
 - Tell the LLM to use policy tool decisions as authoritative.
 - Keep final responses grounded in tool results.
+- Make the LLM gateway explicit about multiple tool-call responses. Today the
+  prompt says "call at most one tool at a time" and the adapter reads only the
+  first returned tool call. In production, do not silently drop extra tool
+  calls. Detect multiple returned tool calls and either reject/retry with a
+  single-tool instruction or record a guardrail violation.
 
 ### Phase 2: Replace Ad Hoc Eligibility With Policy Decision Packets
 
@@ -282,7 +287,28 @@ Status: in progress.
   - user asks why refund was denied
   - user asks for human support after denial
 
-### Phase 6: Add Observability And Logs
+### Phase 6: Add Routing, Planning, And Controlled Fanout
+
+- Add a route/decompose step that turns the user message into structured
+  intents, such as `order_status`, `refund`, `cancellation`, and
+  `payment_dispute`.
+- Add deterministic tool and intent metadata:
+  - risk category: read-only, policy decision, or mutating workflow
+  - whether the intent/tool is parallel-safe
+  - dependencies on earlier facts or policy decisions
+  - whether user confirmation or human review is required
+- Add a plan node that decides execution shape from structured intents and
+  metadata, not from free-form LLM judgment.
+- Fan out only independent read-only branches. For example, order status and
+  order history can run in parallel when neither depends on the other.
+- Keep dependent workflows sequential. For example, payment transaction checks
+  wait for order history, and refunds wait for refund policy decisions.
+- Do not parallelize multiple mutating actions unless deterministic policy
+  explicitly allows the sequence.
+- Add a join node that merges branch results and produces one final
+  customer-facing response.
+
+### Phase 7: Add Observability And Logs
 
 Start locally, then move to production-grade observability.
 
@@ -293,6 +319,7 @@ Local logs should capture:
 - Customer ID and order ID.
 - Reason step number.
 - LLM request metadata.
+- Count of tool calls returned by the LLM.
 - Tool call name and arguments.
 - Tool result summary.
 - Guardrail result.
@@ -315,7 +342,7 @@ Business audit logs prove what action actually happened.
 Policy logs prove why the action was allowed or escalated.
 ```
 
-### Phase 7: Evals And Regression Tests
+### Phase 8: Evals And Regression Tests
 
 Build an eval suite for:
 
