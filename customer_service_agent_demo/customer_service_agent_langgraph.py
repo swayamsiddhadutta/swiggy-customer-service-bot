@@ -20,11 +20,16 @@ import json
 import os
 import operator
 import re
+import sys
 import uuid
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 import os as _os
+
+DEMO_DIR = Path(__file__).resolve().parent
+if str(DEMO_DIR) not in sys.path:
+    sys.path.insert(0, str(DEMO_DIR))
 
 try:
     from langgraph.graph import END, START, StateGraph
@@ -37,6 +42,14 @@ except Exception as exc:  # pragma: no cover - friendly runtime message
     ) from exc
 
 from llm_gateway import LLMConfig, OpenAICompatibleToolCallingClient
+from observability import (
+    add_span_outputs,
+    base_trace_tags,
+    configure_langsmith_defaults,
+    langsmith_span,
+    run_metadata,
+    traceable,
+)
 from swiggy_backend import (
     DB_PATH,
     MAX_REASON_STEPS,
@@ -72,6 +85,10 @@ class CustomerServiceState(TypedDict, total=False):
     run_id: str
     case_id: str | None
     planner: str
+    llm_provider: str | None
+    llm_model: str | None
+    llm_base_url: str | None
+    llm_api_key_env: str | None
     customer_id: str
     order_id: str | None
     user_message: str
@@ -94,6 +111,11 @@ def compact_trace(state: CustomerServiceState) -> list[str]:
     return lines[-8:]
 
 
+@traceable(
+    name="deterministic_planner",
+    run_type="chain",
+    tags=["customer-service-demo", "planner", "deterministic"],
+)
 def choose_next_message(state: CustomerServiceState) -> Message:
     """
     Deterministic local stand-in for `llm_with_tools.invoke(...)`.
@@ -212,6 +234,11 @@ def candidate_phrases(words: list[str], max_length: int) -> list[str]:
     return phrases
 
 
+@traceable(
+    name="refund_item_resolution",
+    run_type="chain",
+    tags=["customer-service-demo", "guardrail"],
+)
 def resolve_refund_item_mention(state: CustomerServiceState, item: Any) -> dict[str, Any]:
     normalized_item = normalize_for_match(item)
     normalized_message = normalize_for_match(state.get("user_message", ""))
@@ -510,51 +537,61 @@ def choose_cancel_message(
     }
 
 
-def make_reason_node(
-    planner: Literal["deterministic", "llm"],
-    llm_client: OpenAICompatibleToolCallingClient | None,
-):
-    def reason_node(state: CustomerServiceState) -> dict[str, Any]:
-        node_input = {
-            "planner": planner,
-            "messages": snapshot(state.get("messages", [])),
-            "facts": snapshot(state.get("facts", {})),
-            "reason_steps": state.get("reason_steps", 0),
-        }
-        next_reason_steps = state.get("reason_steps", 0) + 1
-
-        if next_reason_steps > MAX_REASON_STEPS:
-            response = forced_step_cap_message(state)
-        elif planner == "llm":
-            if llm_client is None:
-                raise RuntimeError("planner='llm' requires an LLM client")
-            response = llm_client.next_message(state)
-        else:
-            response = choose_next_message(state)
-
-        pending_tool_call = response.get("tool_call")
-        update: dict[str, Any] = {
-            "messages": [response],
-            "pending_tool_call": pending_tool_call,
-            "reason_steps": next_reason_steps,
-        }
-
-        if not pending_tool_call:
-            update["final_answer"] = str(response["content"])
-
-        trace_event = {
-            "run_id": state.get("run_id"),
-            "case_id": state.get("case_id"),
-            "node": "reason",
-            "reason_step": next_reason_steps,
-            "input": node_input,
-            "output": snapshot(update),
-        }
-        return {**update, "trace": [trace_event]}
-
-    return reason_node
+def make_runtime_llm_client(state: CustomerServiceState) -> OpenAICompatibleToolCallingClient:
+    config = LLMConfig.from_env(
+        provider=state.get("llm_provider"),
+        model=state.get("llm_model"),
+        base_url=state.get("llm_base_url"),
+        api_key_env=state.get("llm_api_key_env"),
+    )
+    return OpenAICompatibleToolCallingClient(config)
 
 
+def reason_node(state: CustomerServiceState) -> dict[str, Any]:
+    planner = state.get("planner", "deterministic")
+    node_input = {
+        "planner": planner,
+        "messages": snapshot(state.get("messages", [])),
+        "facts": snapshot(state.get("facts", {})),
+        "reason_steps": state.get("reason_steps", 0),
+    }
+    next_reason_steps = state.get("reason_steps", 0) + 1
+
+    if next_reason_steps > MAX_REASON_STEPS:
+        response = forced_step_cap_message(state)
+    elif planner == "llm":
+        response = make_runtime_llm_client(state).next_message(state)
+    elif planner == "deterministic":
+        response = choose_next_message(state)
+    else:
+        raise ValueError(f"Unsupported planner: {planner!r}")
+
+    pending_tool_call = response.get("tool_call")
+    update: dict[str, Any] = {
+        "messages": [response],
+        "pending_tool_call": pending_tool_call,
+        "reason_steps": next_reason_steps,
+    }
+
+    if not pending_tool_call:
+        update["final_answer"] = str(response["content"])
+
+    trace_event = {
+        "run_id": state.get("run_id"),
+        "case_id": state.get("case_id"),
+        "node": "reason",
+        "reason_step": next_reason_steps,
+        "input": node_input,
+        "output": snapshot(update),
+    }
+    return {**update, "trace": [trace_event]}
+
+
+@traceable(
+    name="tool_guardrail",
+    run_type="chain",
+    tags=["customer-service-demo", "guardrail"],
+)
 def guardrails_for_tool_call(
     state: CustomerServiceState,
     tool_call: ToolCall,
@@ -600,6 +637,11 @@ def guardrails_for_tool_call(
     return {"allow": False, "reason": "unknown_tool_risk"}
 
 
+@traceable(
+    name="normalize_tool_call",
+    run_type="chain",
+    tags=["customer-service-demo", "tool-call"],
+)
 def normalize_tool_call(state: CustomerServiceState, tool_call: ToolCall) -> ToolCall:
     """Attach system-owned arguments that should not depend on the LLM."""
     normalized: ToolCall = {
@@ -664,28 +706,42 @@ def act_node(state: CustomerServiceState) -> dict[str, Any]:
                 "facts": {tool_call["name"]: {"ok": False, "error": "user_declined_tool_execution"}},
                 "pending_tool_call": None,
             }
-    if not guardrail["allow"]:
-        tool_result = {
-            "ok": False,
-            "error": "blocked_by_guardrail",
-            "guardrail": guardrail,
-        }
-    else:
-        tool = TOOLS[tool_call["name"]]
-        try:
-            tool_result = tool(**tool_call["args"])
-        except TypeError as exc:
+    with langsmith_span(
+        f"tool:{tool_call['name']}",
+        run_type="tool",
+        inputs={"tool_call": snapshot(tool_call), "guardrail": snapshot(guardrail)},
+        metadata={
+            "tool_name": tool_call["name"],
+            "risk": guardrail.get("risk"),
+            "allow": guardrail["allow"],
+            "run_id": state.get("run_id"),
+            "case_id": state.get("case_id"),
+        },
+        tags=["customer-service-demo", "backend-tool"],
+    ) as tool_span:
+        if not guardrail["allow"]:
             tool_result = {
                 "ok": False,
-                "error": "tool_argument_error",
-                "detail": str(exc),
+                "error": "blocked_by_guardrail",
+                "guardrail": guardrail,
             }
-        except Exception as exc:
-            tool_result = {
-                "ok": False,
-                "error": "tool_execution_error",
-                "detail": f"{type(exc).__name__}: {exc}",
-            }
+        else:
+            tool = TOOLS[tool_call["name"]]
+            try:
+                tool_result = tool(**tool_call["args"])
+            except TypeError as exc:
+                tool_result = {
+                    "ok": False,
+                    "error": "tool_argument_error",
+                    "detail": str(exc),
+                }
+            except Exception as exc:
+                tool_result = {
+                    "ok": False,
+                    "error": "tool_execution_error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+        add_span_outputs(tool_span, {"tool_result": snapshot(tool_result)})
 
     tool_message: Message = {
         "role": "tool",
@@ -716,15 +772,12 @@ def route_after_reason(state: CustomerServiceState) -> Literal["act", "end"]:
     return "end"
 
 
-def build_graph(
-    planner: Literal["deterministic", "llm"] = "deterministic",
-    llm_client: OpenAICompatibleToolCallingClient | None = None,
-):
-    graph = StateGraph(CustomerServiceState)
-    graph.add_node("reason", make_reason_node(planner, llm_client))
-    graph.add_node("act", act_node)
-    graph.add_edge(START, "reason")
-    graph.add_conditional_edges(
+def build_graph():
+    builder = StateGraph(CustomerServiceState)
+    builder.add_node("reason", reason_node)
+    builder.add_node("act", act_node)
+    builder.add_edge(START, "reason")
+    builder.add_conditional_edges(
         "reason",
         route_after_reason,
         {
@@ -732,8 +785,13 @@ def build_graph(
             "end": END,
         },
     )
-    graph.add_edge("act", "reason")
-    return graph.compile()
+    builder.add_edge("act", "reason")
+    return builder.compile()
+
+
+# Exported for LangGraph CLI/Studio via langgraph.json. Normal CLI/eval runs
+# use this same graph and pass planner/model settings through runtime state.
+graph = build_graph()
 
 
 def initial_state(
@@ -743,11 +801,19 @@ def initial_state(
     planner: Literal["deterministic", "llm"] = "deterministic",
     case_id: str | None = None,
     run_id: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key_env: str | None = None,
 ) -> CustomerServiceState:
     return {
         "run_id": run_id or str(uuid.uuid4()),
         "case_id": case_id,
         "planner": planner,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "llm_base_url": llm_base_url,
+        "llm_api_key_env": llm_api_key_env,
         "customer_id": customer_id,
         "order_id": order_id,
         "user_message": user_message,
@@ -766,21 +832,40 @@ def run_agent(
     user_message: str,
     verbose: bool,
     planner: Literal["deterministic", "llm"] = "deterministic",
-    llm_client: OpenAICompatibleToolCallingClient | None = None,
     case_id: str | None = None,
     run_id: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key_env: str | None = None,
 ) -> CustomerServiceState:
-    app = build_graph(planner=planner, llm_client=llm_client)
-    final_state = app.invoke(
-        initial_state(
-            customer_id,
-            order_id,
-            user_message,
-            planner=planner,
-            case_id=case_id,
-            run_id=run_id,
-        ),
-        config={"recursion_limit": 20},
+    configure_langsmith_defaults()
+    state = initial_state(
+        customer_id,
+        order_id,
+        user_message,
+        planner=planner,
+        case_id=case_id,
+        run_id=run_id,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+        llm_api_key_env=llm_api_key_env,
+    )
+    final_state = graph.invoke(
+        state,
+        config={
+            "recursion_limit": 20,
+            "run_name": "customer_service_agent",
+            "tags": base_trace_tags(planner=planner, case_id=case_id),
+            "metadata": run_metadata(
+                run_id=state["run_id"],
+                planner=planner,
+                customer_id=customer_id,
+                order_id=order_id,
+                case_id=case_id,
+            ),
+        },
     )
 
     if verbose:
@@ -885,8 +970,11 @@ def selected_scenarios(scenario_number: int | None) -> list[dict[str, Any]]:
 def run_scenarios(
     verbose: bool,
     planner: Literal["deterministic", "llm"],
-    llm_client: OpenAICompatibleToolCallingClient | None,
     scenario_number: int | None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key_env: str | None = None,
 ) -> list[CustomerServiceState]:
     states = []
     for scenario in selected_scenarios(scenario_number):
@@ -899,8 +987,11 @@ def run_scenarios(
             user_message=scenario["message"],
             verbose=verbose,
             planner=planner,
-            llm_client=llm_client,
             case_id=scenario["name"],
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+            llm_api_key_env=llm_api_key_env,
         )
         states.append(state)
         print(f"\nFINAL: {state.get('final_answer')}")
@@ -950,16 +1041,14 @@ def main() -> None:
         print_real_llm_note()
         return
 
-    llm_client = None
     if args.planner == "llm":
         try:
-            config = LLMConfig.from_env(
+            LLMConfig.from_env(
                 provider=args.provider,
                 model=args.model,
                 base_url=args.base_url,
                 api_key_env=args.api_key_env,
             )
-            llm_client = OpenAICompatibleToolCallingClient(config)
         except (RuntimeError, ValueError) as exc:
             raise SystemExit(f"LLM configuration error: {exc}") from exc
 
@@ -970,8 +1059,11 @@ def main() -> None:
             user_message=args.message,
             verbose=not args.quiet,
             planner=args.planner,
-            llm_client=llm_client,
             case_id=args.case_id,
+            llm_provider=args.provider,
+            llm_model=args.model,
+            llm_base_url=args.base_url,
+            llm_api_key_env=args.api_key_env,
         )
         print(f"\nFINAL: {state.get('final_answer')}")
         states = [state]
@@ -979,8 +1071,11 @@ def main() -> None:
         states = run_scenarios(
             verbose=not args.quiet,
             planner=args.planner,
-            llm_client=llm_client,
             scenario_number=args.scenario,
+            llm_provider=args.provider,
+            llm_model=args.model,
+            llm_base_url=args.base_url,
+            llm_api_key_env=args.api_key_env,
         )
 
     if args.trace_output:

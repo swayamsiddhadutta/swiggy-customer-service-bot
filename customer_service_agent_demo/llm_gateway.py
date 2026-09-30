@@ -8,6 +8,8 @@ from typing import Any
 from openai import OpenAI
 import logging
 
+from observability import add_span_outputs, langsmith_span
+
 
 logging.basicConfig(level=logging.INFO)
 
@@ -289,36 +291,56 @@ class OpenAICompatibleToolCallingClient:
 
     def next_message(self, state: dict[str, Any]) -> dict[str, Any]:
         logging.info("Sending request to remote LLM (model=%s)", self.config.model)
-        completion = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=to_openai_messages(state),
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-            temperature=self.config.temperature,
-        )
-        message = completion.choices[0].message
-        logging.info(
-            "Received LLM response: tool_calls=%s, content_length=%d",
-            bool(message.tool_calls),
-            len((message.content or "")),
-        )
+        messages = to_openai_messages(state)
+        with langsmith_span(
+            "openai_compatible_tool_calling_llm",
+            run_type="llm",
+            inputs={
+                "provider": self.config.provider,
+                "model": self.config.model,
+                "messages": messages,
+                "tools": [schema["function"]["name"] for schema in TOOL_SCHEMAS],
+            },
+            metadata={
+                "provider": self.config.provider,
+                "model": self.config.model,
+                "base_url": self.config.base_url,
+                "temperature": self.config.temperature,
+            },
+            tags=["customer-service-demo", "llm", self.config.provider],
+        ) as llm_span:
+            completion = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+                temperature=self.config.temperature,
+            )
+            message = completion.choices[0].message
+            logging.info(
+                "Received LLM response: tool_calls=%s, content_length=%d",
+                bool(message.tool_calls),
+                len((message.content or "")),
+            )
 
-        if message.tool_calls:
-            tool_call = message.tool_calls[0]
-            return {
-                "role": "assistant",
-                "content": message.content or "",
-                "tool_call": {
-                    "id": tool_call.id,
-                    "name": tool_call.function.name,
-                    "args": parse_tool_arguments(tool_call.function.arguments),
-                },
-            }
-
-        return {
-            "role": "assistant",
-            "content": message.content or "I could not produce a response.",
-        }
+            if message.tool_calls:
+                tool_call = message.tool_calls[0]
+                response = {
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_call": {
+                        "id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "args": parse_tool_arguments(tool_call.function.arguments),
+                    },
+                }
+            else:
+                response = {
+                    "role": "assistant",
+                    "content": message.content or "I could not produce a response.",
+                }
+            add_span_outputs(llm_span, {"message": response})
+            return response
 
 
 def to_openai_messages(state: dict[str, Any]) -> list[dict[str, Any]]:

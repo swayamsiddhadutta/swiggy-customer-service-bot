@@ -1,2 +1,4 @@
 langgraph>=1.0
+langgraph-cli[inmem]>=0.4
+langsmith>=0.3
 openai>=2.0

@@ -18,6 +18,27 @@ python3 customer_service_agent_demo/evals/run_local_evals.py \
   --trace-output .context/local_eval_traces.jsonl
 ```
 
+For LangSmith or real-LLM checks, use the smoke subset so only two golden cases
+run:
+
+```bash
+python3 customer_service_agent_demo/evals/run_local_evals.py \
+  --cases customer_service_agent_demo/evals/golden_cases_smoke.jsonl \
+  --trace-output .context/local_eval_traces_smoke.jsonl
+```
+
+To also send each eval case to LangSmith, set the tracing environment before
+running the same command:
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=your_langsmith_api_key
+export LANGSMITH_PROJECT=customer-service-agent-demo
+```
+
+In LangSmith, open `Tracing`, select `customer-service-agent-demo`, and filter
+for the `eval-case` tag or a specific `case_id` metadata value.
+
 This defaults to `--planner deterministic`, which is the stable local baseline.
 To evaluate the real LLM planner path, provide the same provider configuration
 used by `customer_service_agent_langgraph.py`:
@@ -25,8 +46,13 @@ used by `customer_service_agent_langgraph.py`:
 ```bash
 python3 customer_service_agent_demo/evals/run_local_evals.py \
   --planner llm \
+  --cases customer_service_agent_demo/evals/golden_cases_smoke.jsonl \
   --trace-output .context/local_eval_traces_llm.jsonl
 ```
+
+The smoke file caps the run to two eval cases. In `--planner llm` mode, each
+case can still make multiple model calls because every graph reasoning step asks
+the LLM what to do next.
 
 Run local evals serially. The demo uses one local SQLite database, and
 parallel runs can interfere with cases that mutate orders, refunds, or tickets.
@@ -82,16 +108,15 @@ Each JSONL row in `golden_cases.jsonl` has:
 }
 ```
 
-## Where Logging Fits
+## Where Observability Fits
 
-Yes, we should add trace/log statements in the code. The clean order is:
+The local JSONL trace output and LangSmith traces serve different purposes:
 
-1. Define golden case expectations.
-2. Add local trace capture with the fields needed to score those expectations.
-3. Write a local eval runner that compares traces against golden cases.
-4. Later export the same run structure to LangSmith or OpenTelemetry.
+- JSONL trace output is stable and easy to diff in local/CI evals.
+- LangSmith traces are interactive and better for debugging the run tree,
+  inputs, outputs, metadata, tool spans, and real LLM behavior.
 
-The trace should capture at least:
+The local trace should capture at least:
 
 - `run_id`
 - `case_id`
@@ -105,5 +130,5 @@ The trace should capture at least:
 - `final_answer`
 - `error`
 
-This makes the local eval runner simple and keeps the later observability
-integration from changing the eval semantics.
+This keeps the eval runner simple while LangSmith gives us the richer debugging
+view for the same cases.

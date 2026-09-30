@@ -342,6 +342,47 @@ Business audit logs prove what action actually happened.
 Policy logs prove why the action was allowed or escalated.
 ```
 
+Production trace sampling should be explicit rather than accidental. Add a
+small wrapper around the top-level graph invocation to decide whether a request
+is traced, which project receives it, and which tags or metadata are attached.
+Sampling can be request-based, user-based, or thread-based:
+
+```text
+request-based sampling: each graph invocation is sampled independently
+user-based sampling: the same users are consistently traced or skipped
+thread-based sampling: whole conversations are consistently traced or skipped
+```
+
+LangSmith sampling is useful for reducing normal trace volume, but it is
+head-based: the decision happens before the run completes. That means a request
+that was not traced from the start cannot later produce a complete trace tree if
+it fails. Do not rely on sampled LangSmith traces as the only source of
+production error visibility.
+
+Future production observability action items:
+
+| Action item | Why it matters | Target shape |
+| --- | --- | --- |
+| Add a top-level tracing wrapper | Centralizes LangSmith project routing, sampling, tags, metadata, redaction, and environment handling. | `invoke_agent_with_tracing(...)` wraps `graph.invoke(...)`. |
+| Add OpenTelemetry tail-based sampling | Keeps 100% of error traces, slow traces, risky tool traces, and guardrail-blocked traces while sampling normal successes. | App emits OTel spans to a collector; collector decides keep/drop after seeing full trace status. |
+| Always log application errors separately | LangSmith trace sampling may skip the run that later fails, so production needs complete error coverage. | Send 100% of errors to Sentry, Datadog, CloudWatch, ELK, or equivalent with `request_id`, `thread_id`, `agent_run_id`, and `langsmith_trace_id` when available. |
+| Correlate logs and traces | Engineers should be able to jump from an error alert to the relevant agent trace when it exists. | Include trace IDs in app logs and error reports; include log/request IDs in LangSmith metadata. |
+| Promote production failures into evals | Production observability should improve pre-deploy protection over time. | Convert recurring bad traces, user complaints, and guardrail blocks into golden eval cases. |
+
+Recommended rollout:
+
+1. **Phase 1: LangSmith wrapper and always-on error logs.** Add the tracing
+   wrapper, sample normal LangSmith traces, always trace known risky routes when
+   possible, and send 100% of real application errors to Sentry, Datadog,
+   CloudWatch, ELK, or equivalent.
+2. **Phase 2: OpenTelemetry instrumentation.** Add OTel spans, metrics, and log
+   correlation while keeping the sampling policy simple. Export traces through
+   a collector, but do not start with complex tail-sampling rules.
+3. **Phase 3: Tail-based sampling when volume justifies it.** Once trace volume,
+   cost, or debugging needs require it, let the OTel collector keep 100% of
+   errors, slow traces, guardrail blocks, and risky tool traces while sampling
+   ordinary successful runs.
+
 ### Phase 8: Evals And Regression Tests
 
 Build an eval suite for:

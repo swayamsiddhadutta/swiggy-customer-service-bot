@@ -349,6 +349,107 @@ Policy logs explain why an action was allowed or denied.
 Business audit logs prove what action actually happened.
 ```
 
+## Trace Sampling Is Not Error Logging
+
+LangSmith is trace-first, not log-level-first. It records traces and spans with
+inputs, outputs, metadata, tags, status, and errors. It is not a replacement for
+normal application logging levels such as `debug`, `info`, `warning`, and
+`error`.
+
+`LANGSMITH_TRACING_SAMPLING_RATE=0.1` means roughly 10% of traces are recorded.
+The sampling unit is usually one top-level agent invocation, such as
+`graph.invoke(...)`, `agent.invoke(...)`, or this demo's `run_agent(...)`. It is
+not automatically "10% of users." If the same user sends a second message later,
+that second invocation can be sampled independently and may be missed even if
+the first one was captured.
+
+If we want consistent sampling by user or conversation, the application should
+make that decision before calling the graph:
+
+```text
+sample by user_id    -> the same 10% of users are always traced
+sample by thread_id  -> the whole conversation is traced or skipped together
+sample by request    -> each agent invocation is sampled independently
+```
+
+The natural production shape is a small wrapper around the top-level agent call.
+That wrapper decides whether to trace, which LangSmith project to use, and which
+tags and metadata to attach. It can include environment, user/thread IDs, model
+version, prompt version, route, risk flags, and whether the request is from
+production, eval, canary, or local development.
+
+The hard caveat is that ordinary sampling is decided before the run starts. If
+a request is not traced and then crashes, LangSmith cannot reconstruct the full
+nested trace tree after the fact. This is why error observability should not
+depend only on sampled LangSmith traces.
+
+Brief production options:
+
+1. **Wrapper/head sampling:** decide before `graph.invoke(...)` whether to trace
+   this user, thread, request, tenant, or route. This is simple and cheap, but
+   it cannot know future errors.
+2. **Trace more important paths up front:** trace 100% during launch, canaries,
+   risky rollouts, or high-risk flows such as refund, cancellation, payment, and
+   account actions.
+3. **Create a forced error trace on exception:** if an unsampled request fails,
+   catch the exception and create a small LangSmith trace with request metadata
+   and the error summary. This preserves an error record but not the original
+   missing span tree.
+4. **Use OpenTelemetry tail-based sampling later:** emit spans to an OTel
+   collector, let the collector see the completed trace, then keep 100% of
+   errors, slow runs, guardrail blocks, or risky tool runs while sampling normal
+   successes.
+5. **Always log real errors separately:** send 100% of application errors to
+   Sentry, Datadog, CloudWatch, ELK, or a similar logging/alerting system.
+   Include request ID, thread ID, agent run ID, and LangSmith trace ID when one
+   exists.
+
+Useful rule of thumb:
+
+```text
+LangSmith = rich sampled agent behavior.
+OpenTelemetry = vendor-neutral trace routing and tail-based sampling later.
+App error logs = complete error coverage and alerting.
+Business audit logs = authoritative record of mutations.
+```
+
+## LangSmith And OpenTelemetry Solve Different Problems
+
+LangSmith is the best first tool for this project because it understands the
+agent development loop: LangGraph traces, spans, tool calls, inputs, outputs,
+metadata, evals, online evaluators, feedback, and trace inspection. It helps us
+answer "what did the agent do and why did this run look wrong?"
+
+OpenTelemetry is a broader telemetry standard. It is useful when agent traces
+need to join the rest of the production stack: HTTP request traces, service
+latency, queue processing, database spans, logs, metrics, alerts, and vendor
+routing. OTel is also where tail-based sampling becomes natural, because a
+collector can see the completed trace before deciding whether to keep it.
+
+Tail-based sampling should not normally add customer-facing latency if telemetry
+export is asynchronous. The cost is observability pipeline latency and
+complexity: the collector buffers incomplete traces, waits for completion or a
+timeout, then decides whether to export them. Traces may appear later in the UI,
+and the collector needs memory, queues, sizing, retry policies, and monitoring.
+
+That makes the sensible rollout:
+
+1. **Start with LangSmith and normal error logging.** Add a top-level tracing
+   wrapper, sample ordinary successful traffic, always trace risky flows when
+   known up front, and log 100% of real application errors to the normal
+   logging/alerting system.
+2. **Add OpenTelemetry after the agent shape is stable.** Emit OTel spans and
+   correlate request IDs, thread IDs, trace IDs, logs, metrics, and service
+   spans, but keep sampling simple at first.
+3. **Use tail-based sampling only when needed.** Introduce collector-side rules
+   once volume or cost justifies the extra moving pieces: keep all errors, slow
+   traces, guardrail blocks, and risky tool traces while sampling ordinary
+   successes.
+
+The main learning is sequencing. LangSmith is the quickest way to debug and
+evaluate the agent. OpenTelemetry is the production integration layer once we
+need cross-service observability, vendor-neutral routing, and smarter sampling.
+
 ## Practical Rules For Future Changes
 
 When adding or changing agent behavior:

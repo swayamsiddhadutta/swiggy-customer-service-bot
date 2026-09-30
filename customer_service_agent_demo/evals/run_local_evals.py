@@ -18,7 +18,6 @@ if str(DEMO_DIR) not in sys.path:
 from customer_service_agent_langgraph import (  # noqa: E402
     DB_PATH,
     LLMConfig,
-    OpenAICompatibleToolCallingClient,
     derive_reason_codes,
     escalation_team,
     init_db,
@@ -43,18 +42,6 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def make_llm_client(args: argparse.Namespace) -> OpenAICompatibleToolCallingClient | None:
-    if args.planner != "llm":
-        return None
-    config = LLMConfig.from_env(
-        provider=args.provider,
-        model=args.model,
-        base_url=args.base_url,
-        api_key_env=args.api_key_env,
-    )
-    return OpenAICompatibleToolCallingClient(config)
-
-
 def normalize_text(value: str) -> str:
     """Normalize generated text for non-brittle local substring checks."""
     value = value.lower().replace("_", " ")
@@ -69,7 +56,7 @@ def normalized_contains(haystack: str, needle: str) -> bool:
 def evaluate_case(
     case: dict[str, Any],
     planner: Literal["deterministic", "llm"],
-    llm_client: OpenAICompatibleToolCallingClient | None,
+    args: argparse.Namespace,
 ) -> tuple[bool, list[str], dict[str, Any]]:
     init_db(DB_PATH)
     state = run_agent(
@@ -78,8 +65,11 @@ def evaluate_case(
         user_message=case["message"],
         verbose=False,
         planner=planner,
-        llm_client=llm_client,
         case_id=case["id"],
+        llm_provider=args.provider,
+        llm_model=args.model,
+        llm_base_url=args.base_url,
+        llm_api_key_env=args.api_key_env,
     )
 
     tools = tool_sequence(state)
@@ -135,13 +125,24 @@ def main() -> int:
     parser.add_argument("--api-key-env", help="Environment variable containing the provider API key.")
     args = parser.parse_args()
 
+    if args.planner == "llm":
+        # Validate LLM config before starting the eval suite.
+        try:
+            LLMConfig.from_env(
+                provider=args.provider,
+                model=args.model,
+                base_url=args.base_url,
+                api_key_env=args.api_key_env,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise SystemExit(f"LLM configuration error: {exc}") from exc
+
     cases = load_cases(args.cases)
-    llm_client = make_llm_client(args)
     traces = []
     failures_by_case = {}
 
     for case in cases:
-        passed, failures, run_trace = evaluate_case(case, args.planner, llm_client)
+        passed, failures, run_trace = evaluate_case(case, args.planner, args)
         traces.append(run_trace)
         status = "PASS" if passed else "FAIL"
         print(f"{status} {case['id']}")

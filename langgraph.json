@@ -1,0 +1,12 @@
+{
+  "dependencies": [
+    "langgraph>=1.0",
+    "langgraph-cli[inmem]>=0.4",
+    "langsmith>=0.3",
+    "openai>=2.0"
+  ],
+  "graphs": {
+    "customer_service_agent": "./customer_service_agent_demo/customer_service_agent_langgraph.py:graph"
+  },
+  "env": "./customer_service_agent_demo/.env"
+}
