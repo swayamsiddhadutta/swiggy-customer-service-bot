@@ -108,6 +108,10 @@ python3 customer_service_agent_demo/evals/run_local_evals.py \
 ```
 
 Eval traces include the `eval-case` tag and the case ID in metadata.
+When LangSmith tracing is enabled, each run also gets online-evaluator feedback
+keys such as `multi_intent_clarification`, `mutation_safety`,
+`tool_execution_health`, and aggregate `agent_policy`. Filter for
+`agent_policy = 0` in LangSmith to find policy failures quickly.
 
 ### LangGraph Studio / Debugger
 

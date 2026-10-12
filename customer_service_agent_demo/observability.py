@@ -24,13 +24,16 @@ def _noop_traceable(*args: Any, **kwargs: Any) -> Any:
 try:
     from langsmith import trace as _langsmith_trace
     from langsmith import traceable as _langsmith_traceable
+    from langsmith import Client as _LangSmithClient
 except ImportError:  # pragma: no cover - keeps local demo runnable without LangSmith
     _langsmith_trace = None
     _langsmith_traceable = _noop_traceable
+    _LangSmithClient = None
 except Exception:  # pragma: no cover - defensive import failure logging
     logger.warning("LangSmith import failed unexpectedly; tracing is disabled.", exc_info=True)
     _langsmith_trace = None
     _langsmith_traceable = _noop_traceable
+    _LangSmithClient = None
 
 
 traceable = _langsmith_traceable
@@ -70,8 +73,9 @@ def run_metadata(
     customer_id: str,
     order_id: str | None,
     case_id: str | None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         "app": "customer-service-agent-demo",
         "run_id": run_id,
         "planner": planner,
@@ -79,6 +83,9 @@ def run_metadata(
         "order_id": order_id,
         "case_id": case_id,
     }
+    if extra:
+        metadata.update(extra)
+    return metadata
 
 
 @contextmanager
@@ -113,3 +120,66 @@ def add_span_outputs(span: Any | None, outputs: dict[str, Any]) -> None:
         return
     if hasattr(span, "add_outputs"):
         span.add_outputs(outputs)
+
+
+def publish_langsmith_feedback(
+    *,
+    trace_id: str,
+    evaluations: list[dict[str, Any]],
+) -> None:
+    """Attach lightweight online-evaluator scores to the LangSmith trace."""
+    if _LangSmithClient is None or not langsmith_tracing_enabled():
+        return
+
+    try:
+        client = _LangSmithClient()
+    except Exception:
+        logger.warning("Could not create LangSmith client for feedback.", exc_info=True)
+        return
+    session_id = None
+    project_name = os.getenv("LANGSMITH_PROJECT") or DEFAULT_LANGSMITH_PROJECT
+    try:
+        session_id = client.read_project(project_name=project_name).id
+    except Exception:
+        logger.warning(
+            "Could not resolve LangSmith project %r for feedback session_id.",
+            project_name,
+            exc_info=True,
+        )
+
+    for evaluation in evaluations:
+        try:
+            client.create_feedback(
+                trace_id=trace_id,
+                key=evaluation["key"],
+                score=evaluation["score"],
+                value=evaluation.get("value"),
+                comment=evaluation.get("comment"),
+                source_info={
+                    "source": "customer_service_agent_demo_online_evaluator",
+                    **evaluation.get("metadata", {}),
+                },
+                session_id=session_id,
+            )
+        except TypeError:
+            # Older SDKs may not accept value/source_info together.
+            try:
+                client.create_feedback(
+                    trace_id=trace_id,
+                    key=evaluation["key"],
+                    score=evaluation["score"],
+                    comment=evaluation.get("comment"),
+                    session_id=session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not publish LangSmith feedback %s.",
+                    evaluation.get("key"),
+                    exc_info=True,
+                )
+        except Exception:
+            logger.warning(
+                "Could not publish LangSmith feedback %s.",
+                evaluation.get("key"),
+                exc_info=True,
+            )

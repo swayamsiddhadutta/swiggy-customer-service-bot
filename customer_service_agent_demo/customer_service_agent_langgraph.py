@@ -42,11 +42,17 @@ except Exception as exc:  # pragma: no cover - friendly runtime message
     ) from exc
 
 from llm_gateway import LLMConfig, OpenAICompatibleToolCallingClient
+from eval_signals import (
+    detect_intents,
+    evaluate_online_policy,
+    extract_eval_signals,
+)
 from observability import (
     add_span_outputs,
     base_trace_tags,
     configure_langsmith_defaults,
     langsmith_span,
+    publish_langsmith_feedback,
     run_metadata,
     traceable,
 )
@@ -98,6 +104,7 @@ class CustomerServiceState(TypedDict, total=False):
     pending_tool_call: ToolCall | None
     reason_steps: int
     final_answer: str | None
+    online_evaluations: list[dict[str, Any]]
 
 
 def snapshot(value: Any) -> Any:
@@ -204,16 +211,7 @@ def detect_refund_reason(user_text: str) -> Literal["missing_item", "wrong_item"
 
 
 def detected_intents(user_text: str) -> list[str]:
-    intents = []
-    if "where" in user_text or "status" in user_text:
-        intents.append("status")
-    if "missing" in user_text or "refund" in user_text or "wrong" in user_text or "damaged" in user_text:
-        intents.append("refund")
-    if "charged twice" in user_text or "double charged" in user_text:
-        intents.append("payment_dispute")
-    if "cancel" in user_text:
-        intents.append("cancel")
-    return intents
+    return detect_intents(user_text)
 
 
 def normalize_for_match(value: Any) -> str:
@@ -823,6 +821,7 @@ def initial_state(
         "pending_tool_call": None,
         "reason_steps": 0,
         "final_answer": None,
+        "online_evaluations": [],
     }
 
 
@@ -852,20 +851,38 @@ def run_agent(
         llm_base_url=llm_base_url,
         llm_api_key_env=llm_api_key_env,
     )
+    detected_intent_names = detect_intents(user_message)
+    config: dict[str, Any] = {
+        "recursion_limit": 20,
+        "run_name": "customer_service_agent",
+        "tags": base_trace_tags(planner=planner, case_id=case_id),
+        "metadata": run_metadata(
+            run_id=state["run_id"],
+            planner=planner,
+            customer_id=customer_id,
+            order_id=order_id,
+            case_id=case_id,
+            extra={
+                "detected_intents": detected_intent_names,
+                "intent_count": len(detected_intent_names),
+                "multi_intent": len(detected_intent_names) > 1,
+            },
+        ),
+    }
+    try:
+        config["run_id"] = uuid.UUID(state["run_id"])
+    except ValueError:
+        pass
+
     final_state = graph.invoke(
         state,
-        config={
-            "recursion_limit": 20,
-            "run_name": "customer_service_agent",
-            "tags": base_trace_tags(planner=planner, case_id=case_id),
-            "metadata": run_metadata(
-                run_id=state["run_id"],
-                planner=planner,
-                customer_id=customer_id,
-                order_id=order_id,
-                case_id=case_id,
-            ),
-        },
+        config=config,
+    )
+    online_evaluations = evaluate_online_policy(final_state)
+    final_state["online_evaluations"] = online_evaluations
+    publish_langsmith_feedback(
+        trace_id=state["run_id"],
+        evaluations=online_evaluations,
     )
 
     if verbose:
@@ -937,6 +954,8 @@ def normalized_run_trace(state: CustomerServiceState) -> dict[str, Any]:
         "final_answer": state.get("final_answer"),
         "reason_steps": state.get("reason_steps"),
         "trace_event_count": len(state.get("trace", [])),
+        "eval_signals": extract_eval_signals(state),
+        "online_evaluations": state.get("online_evaluations", []),
     }
 
 

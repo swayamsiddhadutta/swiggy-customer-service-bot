@@ -150,6 +150,13 @@ def main() -> int:
             failures_by_case[case["id"]] = failures
             for failure in failures:
                 print(f"  - {failure}")
+        online_eval_failures = [
+            evaluation
+            for evaluation in run_trace.get("online_evaluations", [])
+            if evaluation.get("score") == 0
+        ]
+        for evaluation in online_eval_failures:
+            print(f"  - online eval {evaluation['key']}: {evaluation.get('comment')}")
 
     if args.trace_output:
         write_trace(args.trace_output, traces)

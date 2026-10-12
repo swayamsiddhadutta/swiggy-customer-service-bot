@@ -201,6 +201,42 @@ The graph should preserve enough state for a support reviewer to see:
 - Reason for escalation.
 - Suggested team and priority.
 
+### 8. Ad Hoc User Data Queries
+
+Users may ask flexible questions about their own historical data, such as:
+
+```text
+What did I order two days ago?
+Which restaurant did I order biryani from last month?
+How much did I spend on delivery fees this week?
+```
+
+The first production choice should not be unrestricted text-to-SQL. Prefer this
+ladder:
+
+1. Add narrow read-only tools for common questions, such as
+   `search_customer_orders(customer_id, filters)`.
+2. Add structured query tools where the LLM extracts filters but code builds the
+   SQL.
+3. Add text-to-SQL only if the query surface is broad enough to justify it.
+
+If text-to-SQL is added, it must run behind deterministic controls:
+
+- Read-only database user.
+- Read replica or analytics store, not the primary write database.
+- Curated views or a semantic layer, not raw production tables.
+- Customer/user permission filters injected by code, never trusted from the LLM.
+- Table and column allowlists.
+- SQL parser or AST validation.
+- Only `SELECT` statements.
+- Forced row limits, timeouts, and cost limits.
+- Audit logs containing user, question, generated SQL, validation result, row
+  count, and final answer.
+- Golden evals with expected result sets or result hashes.
+
+The LLM may propose a query plan, filters, or SQL draft, but code must own
+authorization, validation, execution limits, and result shaping.
+
 ## Target Tool Categories
 
 ### Read-Only Lookup Tools
@@ -209,6 +245,7 @@ The graph should preserve enough state for a support reviewer to see:
 get_order_status
 get_order_details
 get_order_history
+search_customer_orders
 check_payment_transactions
 search_policy_docs
 retrieve_policy_clause
@@ -281,17 +318,32 @@ Status: in progress.
 
 - Persist conversation state by `thread_id`.
 - Allow follow-up user messages to reuse prior facts and decisions.
+- Add stable per-turn identifiers in addition to `thread_id`, so each
+  `graph.invoke(...)` can be evaluated independently while still belonging to
+  one customer conversation.
+- Store pending clarification state, such as "asked user to choose between
+  status and cancellation," so the next turn can validate that the user selected
+  one intent before resuming tool use.
+- Add conversation-level outcome fields:
+  - resolved
+  - escalated
+  - abandoned
+  - latest open clarification
+  - mutating tools used across the thread
+  - repeated tool calls across the thread
 - Add scenarios where the agent asks for missing details, then continues:
   - user reports missing item without naming item
   - user changes order ID
   - user asks why refund was denied
   - user asks for human support after denial
+- Add multi-turn evals where a first turn asks for clarification and a later
+  turn must only pursue the chosen intent.
 
 ### Phase 6: Add Routing, Planning, And Controlled Fanout
 
 - Add a route/decompose step that turns the user message into structured
   intents, such as `order_status`, `refund`, `cancellation`, and
-  `payment_dispute`.
+  `payment_dispute`, and `order_history_query`.
 - Add deterministic tool and intent metadata:
   - risk category: read-only, policy decision, or mutating workflow
   - whether the intent/tool is parallel-safe
@@ -307,6 +359,17 @@ Status: in progress.
   explicitly allows the sequence.
 - Add a join node that merges branch results and produces one final
   customer-facing response.
+
+### Phase 6A: Add Safe Ad Hoc Order Query Support
+
+- Add `search_customer_orders(customer_id, filters)` as a narrow read-only tool
+  before considering generic text-to-SQL.
+- Let the LLM extract date ranges and filters from user wording, but have code
+  inject the authenticated `customer_id` and build parameterized queries.
+- Add evals for questions like "what did I order two days ago?" and "which
+  restaurant did I order from last week?"
+- If generic text-to-SQL is later needed, restrict it to curated read-only
+  views with validation, limits, audit logs, and permission enforcement.
 
 ### Phase 7: Add Observability And Logs
 
@@ -397,6 +460,68 @@ Build an eval suite for:
 - Duplicate mutating action prevention.
 
 Every production policy change should have corresponding eval cases.
+
+Future online evaluator shape:
+
+```text
+Runtime guardrails:
+  prevent unsafe actions before they happen
+
+App-side online evaluators:
+  score each completed graph invocation and attach feedback to the trace
+
+LangSmith server-side online evaluators:
+  continuously score sampled production traces, support backfills, and power
+  dashboards, alerts, and review queues
+
+Offline golden evals:
+  prevent known regressions before deployment
+```
+
+Recommended split:
+
+| Evaluator/check | Where it should run | Reason |
+| --- | --- | --- |
+| Tool allowlist | App guardrail before tool execution | Must block immediately. |
+| Refund and cancellation policy | App policy tool and guardrail before mutation | Protects money and order state. |
+| Multi-intent before tool use | App guardrail plus online evaluator | Prevents unsafe action and detects regressions. |
+| Tool execution errors and guardrail blocks | App-side online evaluator and LangSmith | Immediate trace feedback plus production monitoring. |
+| Tone, helpfulness, and conversation quality | LangSmith LLM-as-judge online evaluator | Too subjective and costly for the critical path. |
+| Production drift and anomaly detection | LangSmith server-side online evaluator | Needs sampling, aggregation, and dashboards. |
+| Known failure contracts | Offline golden evals | Blocks regressions before rollout. |
+
+Turn-level online evaluators should run after every completed LangGraph
+invocation. They answer: "Was this one response safe and policy-compliant?"
+
+Conversation-level evaluators should run when a thread closes, times out,
+escalates, or is sampled for review. They answer: "Did the agent behave well
+across the whole interaction?" Examples include:
+
+- If the agent asked the user to choose between multiple intents, the following
+  turn should only pursue the selected intent.
+- The agent should not repeat the same tool call without new user input or new
+  backend state.
+- The agent should not contradict a policy decision from an earlier turn.
+- Mutating tools across the thread should be explainable from user intent,
+  policy decisions, and confirmations.
+
+For LangSmith grouping, every trace should include:
+
+```json
+{
+  "thread_id": "conversation identifier",
+  "turn_id": "per-user-message identifier",
+  "run_id": "per-graph-invocation identifier",
+  "customer_id": "customer identifier",
+  "order_id": "current order identifier",
+  "route": "selected route or flow",
+  "risk_level": "read_only | policy | mutating"
+}
+```
+
+The goal is not to choose app-side or LangSmith-side evaluation exclusively.
+The production pattern should be prevention in the app, detection and trend
+monitoring in LangSmith, and regression protection in offline datasets.
 
 ## Interview Summary
 

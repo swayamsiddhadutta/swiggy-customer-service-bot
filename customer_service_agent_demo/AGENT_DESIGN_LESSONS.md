@@ -258,6 +258,63 @@ Keep dependent work inside sequential subflows.
 Do not parallelize mutating business actions without explicit policy approval.
 ```
 
+## Text-To-SQL Should Be A Last Resort
+
+For flexible user-data questions, it is tempting to give the LLM a SQL tool and
+let it query the database directly. That should not be the default production
+choice.
+
+Example:
+
+```text
+User: "What did I order two days ago?"
+```
+
+Safer ladder:
+
+1. Add a narrow read-only tool:
+
+   ```text
+   search_customer_orders(customer_id, filters)
+   ```
+
+2. Add a structured query tool where the LLM extracts filters, but code builds
+   the SQL.
+3. Use text-to-SQL only when narrow tools and structured query tools cannot
+   cover the legitimate query surface.
+
+The reason is the same core agent principle: the LLM can understand language,
+but code should own authorization and execution. The LLM may extract:
+
+```json
+{
+  "intent": "order_history_query",
+  "date_range": "two_days_ago"
+}
+```
+
+but code should inject the authenticated customer ID and build the query:
+
+```text
+WHERE customer_id = authenticated_customer_id
+```
+
+If text-to-SQL is eventually added, it should run only over restricted read-only
+views or a semantic layer, with:
+
+- read-only credentials
+- row-level or application-enforced customer permissions
+- table and column allowlists
+- SQL parser or AST validation
+- forced `LIMIT`
+- timeouts and cost limits
+- audit logs of the question, generated SQL, validation result, and result size
+- evals with expected result sets
+
+Do not let the model be responsible for remembering permissions like "only this
+customer's data." Permission filters must be deterministic and enforced outside
+the prompt.
+
 ## Evals Are How We Notice Architecture Pressure
 
 Routing, separate prompts, and specialized subgraphs should not be added only
@@ -288,6 +345,102 @@ Signals that routing may be needed:
 
 One failure is not enough to justify a new graph architecture. Repeated patterns
 across evals and traces are the real signal.
+
+## Online Evaluators Need Clear Ownership
+
+Online evaluation is not just "log more fields and filter in the UI." The
+complete loop is:
+
+```text
+trace useful facts
+  -> run an evaluator automatically
+  -> store the score as feedback
+  -> alert, filter, review, or promote failures into offline evals
+```
+
+There are three different places evaluator-like logic can live:
+
+1. **Runtime guardrails inside the app.** These run before a tool executes and
+   must block unsafe behavior. They are prevention, not just evaluation.
+2. **App-side online evaluators.** These run after one completed graph
+   invocation and attach feedback to the trace. They are useful for cheap,
+   deterministic checks that should be available immediately.
+3. **LangSmith server-side online evaluators.** These run on traced production
+   runs outside the app. They are better for sampling, backfills, dashboards,
+   LLM-as-judge checks, drift monitoring, and review queues.
+
+The best production pattern is hybrid:
+
+```text
+guardrails prevent unsafe behavior
+app-side evaluators attach immediate deterministic feedback
+LangSmith-side evaluators monitor production behavior over time
+offline golden evals prevent known regressions before deployment
+```
+
+For example, a mixed status-plus-cancel request should be protected at multiple
+layers:
+
+- The app guardrail should prevent mutating tools before clarification.
+- The app-side evaluator should score the completed run as a failure if tools
+  were called before the user chose one intent.
+- A LangSmith-side evaluator should monitor production traces for the same
+  pattern, especially on sampled real LLM traffic.
+- The golden eval should keep this behavior from regressing before deploy.
+
+The division matters because evaluators that merely detect bad behavior after
+the response cannot protect money, orders, account state, or user trust. Any
+policy that must affect the current customer-visible action belongs in runtime
+policy tools or guardrails.
+
+## Multi-Turn Conversations Need Thread-Level Evals
+
+A single LangGraph invocation usually corresponds to one user turn:
+
+```text
+user message
+  -> graph.invoke(...)
+  -> assistant response
+  -> turn-level evaluator feedback
+```
+
+That is necessary but not sufficient for a support conversation. Multi-turn
+agents need two evaluation scopes:
+
+| Scope | When it runs | What it answers |
+| --- | --- | --- |
+| Turn-level eval | After each graph invocation | Was this response safe, grounded, and policy-compliant? |
+| Thread-level eval | At close, timeout, escalation, or sampling | Did the agent behave well across the whole conversation? |
+
+Thread-level evaluation catches failures that a single turn cannot see:
+
+- The agent asked for clarification but ignored the user's answer.
+- The agent contradicted an earlier policy decision.
+- The agent repeated the same tool call without new information.
+- The agent handled one intent safely in isolation but failed the overall task.
+- The agent performed multiple mutations across turns without a coherent user
+  confirmation and policy trail.
+
+For the multi-intent case, the thread-level contract is:
+
+```text
+Turn 1:
+  User asks: "Where is my order and can you cancel it?"
+  Agent asks the user to choose one request.
+
+Turn 2:
+  User says: "cancel it"
+  Agent may pursue cancellation only.
+```
+
+The first turn should not call tools. The second turn can call the tools needed
+for cancellation because the user selected that intent. This means future
+state must preserve both the pending clarification and the selected intent.
+
+Every production trace should include a stable `thread_id` and per-turn
+metadata such as `turn_id`, `run_id`, `customer_id`, `order_id`, route, risk
+level, and detected intents. Without that shared thread identity, LangSmith can
+show individual runs but cannot reliably evaluate conversation-level behavior.
 
 ## Routing Should Narrow Context, Not Replace Safety
 

@@ -39,6 +39,22 @@ export LANGSMITH_PROJECT=customer-service-agent-demo
 In LangSmith, open `Tracing`, select `customer-service-agent-demo`, and filter
 for the `eval-case` tag or a specific `case_id` metadata value.
 
+The agent also publishes lightweight online-evaluator feedback to each traced
+run when LangSmith tracing is enabled:
+
+- `multi_intent_clarification`: mixed-intent requests must ask the user which
+  intent to handle before any tool call.
+- `mutation_safety`: mutating tools must not run before a multi-intent request
+  is clarified.
+- `tool_execution_health`: tool calls should not hit execution errors or
+  guardrail blocks.
+- `agent_policy`: aggregate pass/fail across the online policy checks.
+
+For production-style triage in LangSmith, filter for `agent_policy = 0` or
+`multi_intent_clarification = 0`. The feedback metadata includes
+`detected_intents`, `intent_count`, `tool_sequence`, `mutating_tools`,
+`blocked_tools`, and `tool_errors`.
+
 This defaults to `--planner deterministic`, which is the stable local baseline.
 To evaluate the real LLM planner path, provide the same provider configuration
 used by `customer_service_agent_langgraph.py`:
@@ -132,3 +148,7 @@ The local trace should capture at least:
 
 This keeps the eval runner simple while LangSmith gives us the richer debugging
 view for the same cases.
+
+The normalized JSONL traces now also include `eval_signals` and
+`online_evaluations`, so the same policy errors visible in LangSmith feedback
+are visible in local/CI artifacts.
