@@ -8,6 +8,8 @@ from typing import Any
 from openai import OpenAI
 import logging
 
+from observability import add_span_outputs, langsmith_span
+
 
 logging.basicConfig(level=logging.INFO)
 
@@ -41,10 +43,22 @@ SYSTEM_PROMPT = """You are a customer-service agent for a Swiggy-like food-deliv
 You must solve the user's request by calling tools when fresh backend data is needed.
 Call at most one tool at a time. Never invent order, payment, refund, or ticket facts.
 
-Guardrail policy:
+Automatic resolution policy:
+- Order status questions can be answered after get_order_status returns current order data.
+- Missing, wrong, or damaged item refund requests require get_order_details followed by check_refund_eligibility.
+- If a refund request does not identify the affected item, ask which item was affected before calling refund tools.
+- If the affected item appears to be a typo or fuzzy match, ask the user to confirm the likely item before calling refund tools.
+- If a refund request does not say the item was missing, wrong, or damaged, ask what was wrong before calling refund tools.
+- If check_refund_eligibility returns eligible=true, you may call issue_refund for that item.
+- If check_refund_eligibility returns eligible=false for a user's refund or remedy request, do not call issue_refund. Treat the request as outside automatic refund policy and call create_escalation_ticket with the returned reason.
+- Payment disputes require get_order_history followed by check_payment_transactions. If duplicate_charge_likely=true or prior_support_contacts is 2 or more, call create_escalation_ticket for the payments team. Do not promise a payment reversal directly.
+- Cancellation requests can be handled automatically only when get_order_status shows cancellable=true.
+- If one user message contains multiple unrelated intents, especially a mix of read-only and mutating requests, ask the user which one to handle first instead of choosing silently.
+
+Execution guardrails:
 - Read-only lookup tools are safe.
-- Refunds require check_refund_eligibility before issue_refund.
-- Payment disputes and repeat unresolved support contacts should be escalated.
+- Call at most one tool at a time.
+- Mutating tools must follow the automatic resolution policy above.
 - If a request is outside automatic policy, create an escalation ticket instead of forcing an action.
 - Mutating actions are audited by the system. Do not expose internal trace details to the user.
 - Keep final replies concise, specific, and customer-friendly.
@@ -106,12 +120,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "issue_refund",
-            "description": "Issue an approved item-level refund. System will enforce idempotency.",
+            "description": "Issue an approved item-level refund. The reason must match the prior check_refund_eligibility result. System will enforce idempotency.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "order_id": {"type": "string"},
                     "item": {"type": "string"},
+                    "reason": {
+                        "type": "string",
+                        "enum": ["missing_item", "wrong_item", "damaged_item"],
+                    },
                     "idempotency_key": {"type": "string"},
                 },
                 "required": ["order_id", "item"],
@@ -273,36 +291,56 @@ class OpenAICompatibleToolCallingClient:
 
     def next_message(self, state: dict[str, Any]) -> dict[str, Any]:
         logging.info("Sending request to remote LLM (model=%s)", self.config.model)
-        completion = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=to_openai_messages(state),
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-            temperature=self.config.temperature,
-        )
-        message = completion.choices[0].message
-        logging.info(
-            "Received LLM response: tool_calls=%s, content_length=%d",
-            bool(message.tool_calls),
-            len((message.content or "")),
-        )
+        messages = to_openai_messages(state)
+        with langsmith_span(
+            "openai_compatible_tool_calling_llm",
+            run_type="llm",
+            inputs={
+                "provider": self.config.provider,
+                "model": self.config.model,
+                "messages": messages,
+                "tools": [schema["function"]["name"] for schema in TOOL_SCHEMAS],
+            },
+            metadata={
+                "provider": self.config.provider,
+                "model": self.config.model,
+                "base_url": self.config.base_url,
+                "temperature": self.config.temperature,
+            },
+            tags=["customer-service-demo", "llm", self.config.provider],
+        ) as llm_span:
+            completion = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+                temperature=self.config.temperature,
+            )
+            message = completion.choices[0].message
+            logging.info(
+                "Received LLM response: tool_calls=%s, content_length=%d",
+                bool(message.tool_calls),
+                len((message.content or "")),
+            )
 
-        if message.tool_calls:
-            tool_call = message.tool_calls[0]
-            return {
-                "role": "assistant",
-                "content": message.content or "",
-                "tool_call": {
-                    "id": tool_call.id,
-                    "name": tool_call.function.name,
-                    "args": parse_tool_arguments(tool_call.function.arguments),
-                },
-            }
-
-        return {
-            "role": "assistant",
-            "content": message.content or "I could not produce a response.",
-        }
+            if message.tool_calls:
+                tool_call = message.tool_calls[0]
+                response = {
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_call": {
+                        "id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "args": parse_tool_arguments(tool_call.function.arguments),
+                    },
+                }
+            else:
+                response = {
+                    "role": "assistant",
+                    "content": message.content or "I could not produce a response.",
+                }
+            add_span_outputs(llm_span, {"message": response})
+            return response
 
 
 def to_openai_messages(state: dict[str, Any]) -> list[dict[str, Any]]:

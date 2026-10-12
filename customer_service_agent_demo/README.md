@@ -13,6 +13,9 @@ It shows:
   escalation evidence, and max loop steps.
 - Five simulated scenarios.
 
+See `PRODUCTION_AGENT_PLAN.md` for the production roadmap covering policy
+tools, RAG, guardrails, human review, observability, and evals.
+
 Run it:
 
 ```bash
@@ -46,6 +49,84 @@ Run only final answers from the LangGraph version:
 ```bash
 python3 customer_service_agent_demo/customer_service_agent_langgraph.py --reset-db --quiet
 ```
+
+## LangSmith Observability
+
+This branch instruments the LangGraph demo so each agent run can show up in
+LangSmith as a top-level trace with child spans for:
+
+- the graph run (`customer_service_agent`)
+- deterministic planner decisions
+- refund item resolution
+- tool-call normalization
+- guardrail checks
+- backend tool execution
+- OpenAI-compatible LLM calls when `--planner llm` is used
+
+Install the observability dependencies:
+
+```bash
+python3 -m pip install -r customer_service_agent_demo/requirements.txt
+```
+
+Then enable LangSmith tracing:
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=your_langsmith_api_key
+export LANGSMITH_PROJECT=customer-service-agent-demo
+```
+
+Run one deterministic scenario:
+
+```bash
+python3 customer_service_agent_demo/customer_service_agent_langgraph.py \
+  --reset-db \
+  --scenario 1 \
+  --quiet
+```
+
+Open LangSmith, go to `Tracing`, select the `customer-service-agent-demo`
+project, and click the latest `customer_service_agent` run. The trace tree
+should show the graph run, node execution, planner spans, guardrail spans, and
+tool spans.
+
+Run golden-case evals with the same tracing enabled:
+
+```bash
+python3 customer_service_agent_demo/evals/run_local_evals.py \
+  --trace-output .context/langgraph_run_traces.jsonl
+```
+
+Use the two-case smoke file when tracing real LLM evals to keep token usage low:
+
+```bash
+python3 customer_service_agent_demo/evals/run_local_evals.py \
+  --planner llm \
+  --cases customer_service_agent_demo/evals/golden_cases_smoke.jsonl \
+  --trace-output .context/langgraph_run_traces_smoke.jsonl
+```
+
+Eval traces include the `eval-case` tag and the case ID in metadata.
+When LangSmith tracing is enabled, each run also gets online-evaluator feedback
+keys such as `multi_intent_clarification`, `mutation_safety`,
+`tool_execution_health`, and aggregate `agent_policy`. Filter for
+`agent_policy = 0` in LangSmith to find policy failures quickly.
+
+### LangGraph Studio / Debugger
+
+This repo includes a root `langgraph.json` that points Studio at the compiled
+graph named `customer_service_agent`.
+
+Start the local LangGraph dev server:
+
+```bash
+langgraph dev
+```
+
+The CLI prints local API, docs, and Studio URLs. Open the Studio URL to inspect
+the graph visually and step through runs locally. With the LangSmith environment
+variables above enabled, the same executions should also appear in LangSmith.
 
 Show the standard real LLM setup:
 

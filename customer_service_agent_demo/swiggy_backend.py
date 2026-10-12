@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,6 +25,9 @@ MUTATING_TOOLS = {
     "cancel_order",
     "create_escalation_ticket",
 }
+
+MENU_ITEM_NAMES = ["garlic bread", "filter coffee", "paneer roll", "biryani", "burger", "coke", "pizza", "dosa"]
+ITEM_ALIASES = {"coffee": "filter coffee"}
 
 
 def pretty(value: Any) -> str:
@@ -383,11 +388,80 @@ def init_db(db_path: Path = DB_PATH) -> None:
     conn.close()
 
 
-def detect_item(user_text: str) -> str:
-    for item in ["garlic bread", "filter coffee", "paneer roll", "biryani", "burger", "coke", "pizza", "dosa", "coffee"]:
-        if item in user_text.lower():
-            return "filter coffee" if item == "coffee" else item
-    return "coke"
+def normalize_for_match(value: Any) -> str:
+    text = str(value or "").lower().replace("_", " ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def candidate_phrases(words: list[str], max_length: int) -> list[str]:
+    phrases = []
+    for size in range(1, max_length + 1):
+        for start in range(0, len(words) - size + 1):
+            phrases.append(" ".join(words[start : start + size]))
+    return phrases
+
+
+def resolve_item_mention(user_text: str) -> dict[str, Any]:
+    normalized_text = normalize_for_match(user_text)
+
+    for alias, item in ITEM_ALIASES.items():
+        if alias in normalized_text:
+            return {
+                "decision": "allow",
+                "item": item,
+                "method": "alias",
+                "confidence": 1,
+                "matched_text": alias,
+            }
+
+    for item in MENU_ITEM_NAMES:
+        if normalize_for_match(item) in normalized_text:
+            return {
+                "decision": "allow",
+                "item": item,
+                "method": "exact",
+                "confidence": 1,
+                "matched_text": item,
+            }
+
+    words = normalized_text.split()
+    best_item = None
+    best_score = 0.0
+    best_phrase = ""
+    for item in MENU_ITEM_NAMES:
+        normalized_item = normalize_for_match(item)
+        for phrase in candidate_phrases(words, len(normalized_item.split()) + 1):
+            score = SequenceMatcher(None, normalized_item, phrase).ratio()
+            if score > best_score:
+                best_item = item
+                best_score = score
+                best_phrase = phrase
+
+    if best_score >= 0.84:
+        return {
+            "decision": "confirm",
+            "item": best_item,
+            "suggested_item": best_item,
+            "method": "fuzzy",
+            "confidence": round(best_score, 3),
+            "matched_text": best_phrase,
+        }
+
+    return {
+        "decision": "block",
+        "item": None,
+        "method": "none",
+        "confidence": round(best_score, 3),
+        "best_match": best_phrase,
+    }
+
+
+def detect_item(user_text: str) -> str | None:
+    resolution = resolve_item_mention(user_text)
+    if resolution["decision"] == "allow":
+        return resolution["item"]
+    return None
 
 
 def get_order_status(order_id: str, db_path: Path = DB_PATH) -> dict[str, Any]:
@@ -549,10 +623,11 @@ def issue_refund(
     order_id: str,
     item: str,
     idempotency_key: str,
+    reason: str = "missing_item",
     db_path: Path = DB_PATH,
 ) -> dict[str, Any]:
     """Issue an item-level refund after policy approval."""
-    eligibility = check_refund_eligibility(order_id, item, "missing_item", db_path)
+    eligibility = check_refund_eligibility(order_id, item, reason, db_path)
     if not eligibility.get("eligible"):
         return {
             "ok": False,
@@ -564,7 +639,7 @@ def issue_refund(
     with connect(db_path) as conn:
         existing = row_to_dict(
             conn.execute(
-                "SELECT refund_id, status, amount FROM refunds WHERE idempotency_key = ?",
+                "SELECT refund_id, status, amount, reason FROM refunds WHERE idempotency_key = ?",
                 (idempotency_key,),
             ).fetchone()
         )
@@ -581,7 +656,7 @@ def issue_refund(
                 order_id,
                 eligibility["item"],
                 eligibility["refund_amount"],
-                "missing_item",
+                reason,
                 idempotency_key,
                 "success",
             ),
@@ -594,6 +669,7 @@ def issue_refund(
                 "order_id": order_id,
                 "item": eligibility["item"],
                 "amount": eligibility["refund_amount"],
+                "reason": reason,
                 "idempotency_key": idempotency_key,
             },
         )
@@ -604,6 +680,7 @@ def issue_refund(
         "refund_id": refund_id,
         "status": "success",
         "amount": eligibility["refund_amount"],
+        "reason": reason,
         "eta": "3-5 business days",
     }
 

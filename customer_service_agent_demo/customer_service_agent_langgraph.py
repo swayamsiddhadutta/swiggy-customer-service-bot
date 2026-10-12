@@ -19,9 +19,17 @@ import copy
 import json
 import os
 import operator
+import re
+import sys
+import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 import os as _os
+
+DEMO_DIR = Path(__file__).resolve().parent
+if str(DEMO_DIR) not in sys.path:
+    sys.path.insert(0, str(DEMO_DIR))
 
 try:
     from langgraph.graph import END, START, StateGraph
@@ -34,6 +42,20 @@ except Exception as exc:  # pragma: no cover - friendly runtime message
     ) from exc
 
 from llm_gateway import LLMConfig, OpenAICompatibleToolCallingClient
+from eval_signals import (
+    detect_intents,
+    evaluate_online_policy,
+    extract_eval_signals,
+)
+from observability import (
+    add_span_outputs,
+    base_trace_tags,
+    configure_langsmith_defaults,
+    langsmith_span,
+    publish_langsmith_feedback,
+    run_metadata,
+    traceable,
+)
 from swiggy_backend import (
     DB_PATH,
     MAX_REASON_STEPS,
@@ -41,9 +63,9 @@ from swiggy_backend import (
     READ_ONLY_TOOLS,
     SCENARIOS,
     TOOLS,
-    detect_item,
     init_db,
     pretty,
+    resolve_item_mention,
 )
 
 
@@ -66,6 +88,13 @@ def merge_dict(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
 
 
 class CustomerServiceState(TypedDict, total=False):
+    run_id: str
+    case_id: str | None
+    planner: str
+    llm_provider: str | None
+    llm_model: str | None
+    llm_base_url: str | None
+    llm_api_key_env: str | None
     customer_id: str
     order_id: str | None
     user_message: str
@@ -75,6 +104,7 @@ class CustomerServiceState(TypedDict, total=False):
     pending_tool_call: ToolCall | None
     reason_steps: int
     final_answer: str | None
+    online_evaluations: list[dict[str, Any]]
 
 
 def snapshot(value: Any) -> Any:
@@ -88,6 +118,11 @@ def compact_trace(state: CustomerServiceState) -> list[str]:
     return lines[-8:]
 
 
+@traceable(
+    name="deterministic_planner",
+    run_type="chain",
+    tags=["customer-service-demo", "planner", "deterministic"],
+)
 def choose_next_message(state: CustomerServiceState) -> Message:
     """
     Deterministic local stand-in for `llm_with_tools.invoke(...)`.
@@ -113,6 +148,13 @@ def choose_next_message(state: CustomerServiceState) -> Message:
                     "team": "support-ops",
                 },
             },
+        }
+
+    intents = detected_intents(user_text)
+    if len(intents) > 1:
+        return {
+            "role": "assistant",
+            "content": "I can handle one request at a time. Do you want me to check the order status or cancel the order?",
         }
 
     if "where" in user_text or "status" in user_text:
@@ -151,6 +193,91 @@ def forced_step_cap_message(state: CustomerServiceState) -> Message:
     }
 
 
+def detect_refund_reason(user_text: str) -> Literal["missing_item", "wrong_item", "damaged_item"] | None:
+    if (
+        "missing" in user_text
+        or "without the" in user_text
+        or "without my" in user_text
+        or "did not receive" in user_text
+        or "never got" in user_text
+        or "not delivered" in user_text
+    ):
+        return "missing_item"
+    if "wrong" in user_text:
+        return "wrong_item"
+    if "damaged" in user_text or "spoiled" in user_text or "leaked" in user_text:
+        return "damaged_item"
+    return None
+
+
+def detected_intents(user_text: str) -> list[str]:
+    return detect_intents(user_text)
+
+
+def normalize_for_match(value: Any) -> str:
+    text = str(value or "").lower().replace("_", " ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def phrase_similarity(left: str, right: str) -> float:
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def candidate_phrases(words: list[str], max_length: int) -> list[str]:
+    phrases = []
+    for size in range(1, max_length + 1):
+        for start in range(0, len(words) - size + 1):
+            phrases.append(" ".join(words[start : start + size]))
+    return phrases
+
+
+@traceable(
+    name="refund_item_resolution",
+    run_type="chain",
+    tags=["customer-service-demo", "guardrail"],
+)
+def resolve_refund_item_mention(state: CustomerServiceState, item: Any) -> dict[str, Any]:
+    normalized_item = normalize_for_match(item)
+    normalized_message = normalize_for_match(state.get("user_message", ""))
+    if not normalized_item:
+        return {"decision": "block", "method": "empty_item", "confidence": 0}
+    if normalized_item in normalized_message:
+        return {"decision": "allow", "method": "exact", "confidence": 1}
+
+    aliases = {
+        "filter coffee": {"coffee"},
+    }
+    for alias in aliases.get(normalized_item, set()):
+        if alias in normalized_message:
+            return {"decision": "allow", "method": "alias", "confidence": 1, "alias": alias}
+
+    item_word_count = len(normalized_item.split())
+    best_phrase = ""
+    best_score = 0.0
+    for phrase in candidate_phrases(normalized_message.split(), max(item_word_count + 1, 1)):
+        score = phrase_similarity(normalized_item, phrase)
+        if score > best_score:
+            best_score = score
+            best_phrase = phrase
+
+    if best_score >= 0.84:
+        return {
+            "decision": "confirm",
+            "suggested_item": item,
+            "method": "fuzzy",
+            "confidence": round(best_score, 3),
+            "matched_text": best_phrase,
+        }
+
+    return {
+        "decision": "block",
+        "method": "none",
+        "confidence": round(best_score, 3),
+        "best_match": best_phrase,
+    }
+
+
 def choose_order_status_message(
     state: CustomerServiceState,
     facts: dict[str, Any],
@@ -186,7 +313,25 @@ def choose_refund_message(
     facts: dict[str, Any],
     user_text: str,
 ) -> Message:
-    item = detect_item(user_text)
+    item_resolution = resolve_item_mention(user_text)
+    item = item_resolution.get("item") if item_resolution["decision"] == "allow" else None
+    refund_reason = detect_refund_reason(user_text)
+    if item_resolution["decision"] == "confirm":
+        suggested_item = item_resolution["suggested_item"]
+        return {
+            "role": "assistant",
+            "content": f"Did you mean {suggested_item} was the item affected in your order?",
+        }
+    if item is None:
+        return {
+            "role": "assistant",
+            "content": "Which item was missing from your order?",
+        }
+    if refund_reason is None:
+        return {
+            "role": "assistant",
+            "content": "What was wrong with the item: was it missing, wrong, or damaged?",
+        }
 
     if "get_order_details" not in facts:
         return {
@@ -207,7 +352,7 @@ def choose_refund_message(
                 "args": {
                     "order_id": state.get("order_id"),
                     "item": item,
-                    "reason": "missing_item",
+                    "reason": refund_reason,
                 },
             },
         }
@@ -257,25 +402,28 @@ def choose_refund_message(
                 "args": {
                     "order_id": state.get("order_id"),
                     "item": item,
-                    "idempotency_key": f"refund-{state.get('order_id')}-{item}",
+                    "reason": refund_reason,
+                    "idempotency_key": f"refund-{state.get('order_id')}-{item}-{refund_reason}",
                 },
             },
         }
 
     refund = facts["issue_refund"]
     if refund.get("duplicate_request"):
+        reason_label = refund_reason.replace("_item", "").replace("_", " ")
         return {
             "role": "assistant",
             "content": (
-                f"A refund of Rs {refund['amount']} for the missing {item} "
+                f"A refund of Rs {refund['amount']} for the {reason_label} {item} "
                 "has already been created for this request."
             ),
         }
 
+    reason_label = refund_reason.replace("_item", "").replace("_", " ")
     return {
         "role": "assistant",
         "content": (
-            f"I refunded Rs {refund['amount']} for the missing {item}. "
+            f"I refunded Rs {refund['amount']} for the {reason_label} {item}. "
             f"It should reflect in {refund['eta']}."
         ),
     }
@@ -387,48 +535,61 @@ def choose_cancel_message(
     }
 
 
-def make_reason_node(
-    planner: Literal["deterministic", "llm"],
-    llm_client: OpenAICompatibleToolCallingClient | None,
-):
-    def reason_node(state: CustomerServiceState) -> dict[str, Any]:
-        node_input = {
-            "planner": planner,
-            "messages": snapshot(state.get("messages", [])),
-            "facts": snapshot(state.get("facts", {})),
-            "reason_steps": state.get("reason_steps", 0),
-        }
-        next_reason_steps = state.get("reason_steps", 0) + 1
-
-        if next_reason_steps > MAX_REASON_STEPS:
-            response = forced_step_cap_message(state)
-        elif planner == "llm":
-            if llm_client is None:
-                raise RuntimeError("planner='llm' requires an LLM client")
-            response = llm_client.next_message(state)
-        else:
-            response = choose_next_message(state)
-
-        pending_tool_call = response.get("tool_call")
-        update: dict[str, Any] = {
-            "messages": [response],
-            "pending_tool_call": pending_tool_call,
-            "reason_steps": next_reason_steps,
-        }
-
-        if not pending_tool_call:
-            update["final_answer"] = str(response["content"])
-
-        trace_event = {
-            "node": "reason",
-            "input": node_input,
-            "output": snapshot(update),
-        }
-        return {**update, "trace": [trace_event]}
-
-    return reason_node
+def make_runtime_llm_client(state: CustomerServiceState) -> OpenAICompatibleToolCallingClient:
+    config = LLMConfig.from_env(
+        provider=state.get("llm_provider"),
+        model=state.get("llm_model"),
+        base_url=state.get("llm_base_url"),
+        api_key_env=state.get("llm_api_key_env"),
+    )
+    return OpenAICompatibleToolCallingClient(config)
 
 
+def reason_node(state: CustomerServiceState) -> dict[str, Any]:
+    planner = state.get("planner", "deterministic")
+    node_input = {
+        "planner": planner,
+        "messages": snapshot(state.get("messages", [])),
+        "facts": snapshot(state.get("facts", {})),
+        "reason_steps": state.get("reason_steps", 0),
+    }
+    next_reason_steps = state.get("reason_steps", 0) + 1
+
+    if next_reason_steps > MAX_REASON_STEPS:
+        response = forced_step_cap_message(state)
+    elif planner == "llm":
+        response = make_runtime_llm_client(state).next_message(state)
+    elif planner == "deterministic":
+        response = choose_next_message(state)
+    else:
+        raise ValueError(f"Unsupported planner: {planner!r}")
+
+    pending_tool_call = response.get("tool_call")
+    update: dict[str, Any] = {
+        "messages": [response],
+        "pending_tool_call": pending_tool_call,
+        "reason_steps": next_reason_steps,
+    }
+
+    if not pending_tool_call:
+        update["final_answer"] = str(response["content"])
+
+    trace_event = {
+        "run_id": state.get("run_id"),
+        "case_id": state.get("case_id"),
+        "node": "reason",
+        "reason_step": next_reason_steps,
+        "input": node_input,
+        "output": snapshot(update),
+    }
+    return {**update, "trace": [trace_event]}
+
+
+@traceable(
+    name="tool_guardrail",
+    run_type="chain",
+    tags=["customer-service-demo", "guardrail"],
+)
 def guardrails_for_tool_call(
     state: CustomerServiceState,
     tool_call: ToolCall,
@@ -438,6 +599,18 @@ def guardrails_for_tool_call(
 
     if name not in TOOLS:
         return {"allow": False, "reason": "tool_not_allowlisted"}
+
+    if name in {"check_refund_eligibility", "issue_refund"}:
+        resolution = resolve_refund_item_mention(state, args.get("item"))
+        if resolution["decision"] != "allow":
+            reason = "refund_item_needs_confirmation"
+            if resolution["decision"] == "block":
+                reason = "refund_item_not_specified_by_user"
+            return {
+                "allow": False,
+                "reason": reason,
+                "resolution": resolution,
+            }
 
     if name in READ_ONLY_TOOLS:
         return {"allow": True, "risk": "read_only"}
@@ -450,6 +623,8 @@ def guardrails_for_tool_call(
             eligibility = state.get("facts", {}).get("check_refund_eligibility")
             if not eligibility or not eligibility.get("eligible"):
                 return {"allow": False, "reason": "refund_not_preapproved"}
+            if args.get("reason") != eligibility.get("reason"):
+                return {"allow": False, "reason": "refund_reason_mismatch"}
 
         if name == "create_escalation_ticket":
             if not args.get("reasoning") or not args.get("trace"):
@@ -460,6 +635,11 @@ def guardrails_for_tool_call(
     return {"allow": False, "reason": "unknown_tool_risk"}
 
 
+@traceable(
+    name="normalize_tool_call",
+    run_type="chain",
+    tags=["customer-service-demo", "tool-call"],
+)
 def normalize_tool_call(state: CustomerServiceState, tool_call: ToolCall) -> ToolCall:
     """Attach system-owned arguments that should not depend on the LLM."""
     normalized: ToolCall = {
@@ -469,8 +649,12 @@ def normalize_tool_call(state: CustomerServiceState, tool_call: ToolCall) -> Too
     }
     args = normalized["args"]
 
+    if normalized["name"] == "issue_refund" and not args.get("reason"):
+        eligibility = state.get("facts", {}).get("check_refund_eligibility") or {}
+        args["reason"] = eligibility.get("reason", "missing_item")
+
     if normalized["name"] == "issue_refund" and not args.get("idempotency_key"):
-        args["idempotency_key"] = f"refund-{args.get('order_id')}-{args.get('item')}"
+        args["idempotency_key"] = f"refund-{args.get('order_id')}-{args.get('item')}-{args.get('reason')}"
 
     if normalized["name"] == "cancel_order" and not args.get("idempotency_key"):
         args["idempotency_key"] = f"cancel-{args.get('order_id')}"
@@ -520,28 +704,42 @@ def act_node(state: CustomerServiceState) -> dict[str, Any]:
                 "facts": {tool_call["name"]: {"ok": False, "error": "user_declined_tool_execution"}},
                 "pending_tool_call": None,
             }
-    if not guardrail["allow"]:
-        tool_result = {
-            "ok": False,
-            "error": "blocked_by_guardrail",
-            "guardrail": guardrail,
-        }
-    else:
-        tool = TOOLS[tool_call["name"]]
-        try:
-            tool_result = tool(**tool_call["args"])
-        except TypeError as exc:
+    with langsmith_span(
+        f"tool:{tool_call['name']}",
+        run_type="tool",
+        inputs={"tool_call": snapshot(tool_call), "guardrail": snapshot(guardrail)},
+        metadata={
+            "tool_name": tool_call["name"],
+            "risk": guardrail.get("risk"),
+            "allow": guardrail["allow"],
+            "run_id": state.get("run_id"),
+            "case_id": state.get("case_id"),
+        },
+        tags=["customer-service-demo", "backend-tool"],
+    ) as tool_span:
+        if not guardrail["allow"]:
             tool_result = {
                 "ok": False,
-                "error": "tool_argument_error",
-                "detail": str(exc),
+                "error": "blocked_by_guardrail",
+                "guardrail": guardrail,
             }
-        except Exception as exc:
-            tool_result = {
-                "ok": False,
-                "error": "tool_execution_error",
-                "detail": f"{type(exc).__name__}: {exc}",
-            }
+        else:
+            tool = TOOLS[tool_call["name"]]
+            try:
+                tool_result = tool(**tool_call["args"])
+            except TypeError as exc:
+                tool_result = {
+                    "ok": False,
+                    "error": "tool_argument_error",
+                    "detail": str(exc),
+                }
+            except Exception as exc:
+                tool_result = {
+                    "ok": False,
+                    "error": "tool_execution_error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+        add_span_outputs(tool_span, {"tool_result": snapshot(tool_result)})
 
     tool_message: Message = {
         "role": "tool",
@@ -555,7 +753,10 @@ def act_node(state: CustomerServiceState) -> dict[str, Any]:
         "pending_tool_call": None,
     }
     trace_event = {
+        "run_id": state.get("run_id"),
+        "case_id": state.get("case_id"),
         "node": "act",
+        "reason_step": state.get("reason_steps", 0),
         "input": node_input,
         "guardrail": snapshot(guardrail),
         "output": snapshot(update),
@@ -569,15 +770,12 @@ def route_after_reason(state: CustomerServiceState) -> Literal["act", "end"]:
     return "end"
 
 
-def build_graph(
-    planner: Literal["deterministic", "llm"] = "deterministic",
-    llm_client: OpenAICompatibleToolCallingClient | None = None,
-):
-    graph = StateGraph(CustomerServiceState)
-    graph.add_node("reason", make_reason_node(planner, llm_client))
-    graph.add_node("act", act_node)
-    graph.add_edge(START, "reason")
-    graph.add_conditional_edges(
+def build_graph():
+    builder = StateGraph(CustomerServiceState)
+    builder.add_node("reason", reason_node)
+    builder.add_node("act", act_node)
+    builder.add_edge(START, "reason")
+    builder.add_conditional_edges(
         "reason",
         route_after_reason,
         {
@@ -585,16 +783,35 @@ def build_graph(
             "end": END,
         },
     )
-    graph.add_edge("act", "reason")
-    return graph.compile()
+    builder.add_edge("act", "reason")
+    return builder.compile()
+
+
+# Exported for LangGraph CLI/Studio via langgraph.json. Normal CLI/eval runs
+# use this same graph and pass planner/model settings through runtime state.
+graph = build_graph()
 
 
 def initial_state(
     customer_id: str,
     order_id: str | None,
     user_message: str,
+    planner: Literal["deterministic", "llm"] = "deterministic",
+    case_id: str | None = None,
+    run_id: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key_env: str | None = None,
 ) -> CustomerServiceState:
     return {
+        "run_id": run_id or str(uuid.uuid4()),
+        "case_id": case_id,
+        "planner": planner,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "llm_base_url": llm_base_url,
+        "llm_api_key_env": llm_api_key_env,
         "customer_id": customer_id,
         "order_id": order_id,
         "user_message": user_message,
@@ -604,6 +821,7 @@ def initial_state(
         "pending_tool_call": None,
         "reason_steps": 0,
         "final_answer": None,
+        "online_evaluations": [],
     }
 
 
@@ -613,18 +831,139 @@ def run_agent(
     user_message: str,
     verbose: bool,
     planner: Literal["deterministic", "llm"] = "deterministic",
-    llm_client: OpenAICompatibleToolCallingClient | None = None,
+    case_id: str | None = None,
+    run_id: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key_env: str | None = None,
 ) -> CustomerServiceState:
-    app = build_graph(planner=planner, llm_client=llm_client)
-    final_state = app.invoke(
-        initial_state(customer_id, order_id, user_message),
-        config={"recursion_limit": 20},
+    configure_langsmith_defaults()
+    state = initial_state(
+        customer_id,
+        order_id,
+        user_message,
+        planner=planner,
+        case_id=case_id,
+        run_id=run_id,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+        llm_api_key_env=llm_api_key_env,
+    )
+    detected_intent_names = detect_intents(user_message)
+    config: dict[str, Any] = {
+        "recursion_limit": 20,
+        "run_name": "customer_service_agent",
+        "tags": base_trace_tags(planner=planner, case_id=case_id),
+        "metadata": run_metadata(
+            run_id=state["run_id"],
+            planner=planner,
+            customer_id=customer_id,
+            order_id=order_id,
+            case_id=case_id,
+            extra={
+                "detected_intents": detected_intent_names,
+                "intent_count": len(detected_intent_names),
+                "multi_intent": len(detected_intent_names) > 1,
+            },
+        ),
+    }
+    try:
+        config["run_id"] = uuid.UUID(state["run_id"])
+    except ValueError:
+        pass
+
+    final_state = graph.invoke(
+        state,
+        config=config,
+    )
+    online_evaluations = evaluate_online_policy(final_state)
+    final_state["online_evaluations"] = online_evaluations
+    publish_langsmith_feedback(
+        trace_id=state["run_id"],
+        evaluations=online_evaluations,
     )
 
     if verbose:
         print_trace(final_state)
 
     return final_state
+
+
+def tool_sequence(state: CustomerServiceState) -> list[str]:
+    tools = []
+    for event in state.get("trace", []):
+        if event.get("node") != "act":
+            continue
+        output = event.get("output", {})
+        for message in output.get("messages", []):
+            tool_name = message.get("tool_name")
+            if tool_name:
+                tools.append(tool_name)
+    return tools
+
+
+def derive_reason_codes(state: CustomerServiceState) -> list[str]:
+    facts = state.get("facts", {})
+    reason_codes: list[str] = []
+
+    refund_policy = facts.get("check_refund_eligibility")
+    if refund_policy:
+        reason = refund_policy.get("reason")
+        if reason:
+            reason_codes.append(str(reason))
+
+    history = facts.get("get_order_history")
+    if history and history.get("prior_support_contacts", 0) >= 2:
+        reason_codes.append("repeat_support_contacts")
+
+    payments = facts.get("check_payment_transactions")
+    if payments and payments.get("duplicate_charge_likely"):
+        reason_codes.append("duplicate_charge_likely")
+
+    status = facts.get("get_order_status")
+    user_text = state.get("user_message", "").lower()
+    if status and "cancel" in user_text:
+        if status.get("cancellable"):
+            reason_codes.append("cancellable")
+        elif "cancellable" in status:
+            reason_codes.append("order_not_cancellable")
+
+    return reason_codes
+
+
+def escalation_team(state: CustomerServiceState) -> str | None:
+    ticket = state.get("facts", {}).get("create_escalation_ticket")
+    if not ticket:
+        return None
+    return ticket.get("team")
+
+
+def normalized_run_trace(state: CustomerServiceState) -> dict[str, Any]:
+    return {
+        "run_id": state.get("run_id"),
+        "case_id": state.get("case_id"),
+        "customer_id": state.get("customer_id"),
+        "order_id": state.get("order_id"),
+        "message": state.get("user_message"),
+        "planner": state.get("planner"),
+        "tool_sequence": tool_sequence(state),
+        "reason_codes": derive_reason_codes(state),
+        "escalation_team": escalation_team(state),
+        "final_answer": state.get("final_answer"),
+        "reason_steps": state.get("reason_steps"),
+        "trace_event_count": len(state.get("trace", [])),
+        "eval_signals": extract_eval_signals(state),
+        "online_evaluations": state.get("online_evaluations", []),
+    }
+
+
+def write_run_traces(path: Path, states: list[CustomerServiceState]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for state in states:
+            handle.write(json.dumps(normalized_run_trace(state), sort_keys=True) + "\n")
 
 
 def print_trace(state: CustomerServiceState) -> None:
@@ -650,9 +989,13 @@ def selected_scenarios(scenario_number: int | None) -> list[dict[str, Any]]:
 def run_scenarios(
     verbose: bool,
     planner: Literal["deterministic", "llm"],
-    llm_client: OpenAICompatibleToolCallingClient | None,
     scenario_number: int | None,
-) -> None:
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key_env: str | None = None,
+) -> list[CustomerServiceState]:
+    states = []
     for scenario in selected_scenarios(scenario_number):
         print(f"\n{'=' * 80}")
         print(scenario["name"])
@@ -663,9 +1006,15 @@ def run_scenarios(
             user_message=scenario["message"],
             verbose=verbose,
             planner=planner,
-            llm_client=llm_client,
+            case_id=scenario["name"],
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+            llm_api_key_env=llm_api_key_env,
         )
+        states.append(state)
         print(f"\nFINAL: {state.get('final_answer')}")
+    return states
 
 
 def print_real_llm_note() -> None:
@@ -700,6 +1049,8 @@ def main() -> None:
     parser.add_argument("--customer-id", help="Run a custom single request for this customer.")
     parser.add_argument("--order-id", help="Run a custom single request for this order.")
     parser.add_argument("--message", help="Run a custom single user message.")
+    parser.add_argument("--case-id", help="Optional eval case ID for trace output.")
+    parser.add_argument("--trace-output", type=Path, help="Write normalized local run traces as JSONL.")
     args = parser.parse_args()
 
     if args.reset_db or not Path(DB_PATH).exists():
@@ -709,16 +1060,14 @@ def main() -> None:
         print_real_llm_note()
         return
 
-    llm_client = None
     if args.planner == "llm":
         try:
-            config = LLMConfig.from_env(
+            LLMConfig.from_env(
                 provider=args.provider,
                 model=args.model,
                 base_url=args.base_url,
                 api_key_env=args.api_key_env,
             )
-            llm_client = OpenAICompatibleToolCallingClient(config)
         except (RuntimeError, ValueError) as exc:
             raise SystemExit(f"LLM configuration error: {exc}") from exc
 
@@ -729,16 +1078,28 @@ def main() -> None:
             user_message=args.message,
             verbose=not args.quiet,
             planner=args.planner,
-            llm_client=llm_client,
+            case_id=args.case_id,
+            llm_provider=args.provider,
+            llm_model=args.model,
+            llm_base_url=args.base_url,
+            llm_api_key_env=args.api_key_env,
         )
         print(f"\nFINAL: {state.get('final_answer')}")
+        states = [state]
     else:
-        run_scenarios(
+        states = run_scenarios(
             verbose=not args.quiet,
             planner=args.planner,
-            llm_client=llm_client,
             scenario_number=args.scenario,
+            llm_provider=args.provider,
+            llm_model=args.model,
+            llm_base_url=args.base_url,
+            llm_api_key_env=args.api_key_env,
         )
+
+    if args.trace_output:
+        write_run_traces(args.trace_output, states)
+        print(f"\nTRACE_OUTPUT: {args.trace_output}")
 
 
 if __name__ == "__main__":
