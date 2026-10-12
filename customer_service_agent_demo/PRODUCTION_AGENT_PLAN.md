@@ -284,6 +284,37 @@ Status: in progress.
   calls. Detect multiple returned tool calls and either reject/retry with a
   single-tool instruction or record a guardrail violation.
 
+### Phase 1A: Make Guardrail Blocks Terminal Or Recoverable Outcomes
+
+- Do not route a guardrail-blocked tool call back into the ordinary
+  `act -> reason` loop as if it were a normal tool result.
+- Add an explicit graph path for blocked tool calls:
+  - recoverable blocks return a clarification message and end the current turn
+  - policy blocks return a safe denial or escalation message and end the current
+    turn
+  - internal contract violations are recorded as errors and do not allow retries
+    without new state
+- Store guardrail-block metadata separately from successful tool facts. A blocked
+  mutation should not populate `facts[tool_name]` in a way that later planning
+  can mistake for a completed action.
+- Include blocked tool name, reason code, risk category, and customer-facing
+  outcome in trace metadata for evals and incident review.
+
+### Phase 1B: Make Loop Limits Deterministic
+
+- Treat the graph recursion limit as a final safety fuse, not the primary
+  stopping mechanism.
+- Make `MAX_REASON_STEPS` a true reasoning budget. Once the budget is exhausted,
+  the graph should enter a terminal or explicitly recoverable path instead of
+  continuing normal `reason -> act -> reason` execution.
+- If the step-cap path creates an escalation ticket, it should do so at most once
+  and then produce a final customer-facing response.
+- Add state that distinguishes "step cap reached" and "step-cap escalation
+  already attempted" so the agent cannot repeatedly call the same fallback tool
+  until LangGraph's recursion limit is hit.
+- Add evals that intentionally force the step cap and assert that the final state
+  ends before the recursion limit, with a clear answer or escalation outcome.
+
 ### Phase 2: Replace Ad Hoc Eligibility With Policy Decision Packets
 
 - Rename or wrap `check_refund_eligibility` as `evaluate_refund_policy`.
@@ -460,6 +491,24 @@ Build an eval suite for:
 - Duplicate mutating action prevention.
 
 Every production policy change should have corresponding eval cases.
+
+Use different evaluator types at different deployment stages:
+
+- **Pre-launch and early rollout:** use deterministic evaluators for
+  tool/state safety, such as unsafe mutation, mutation before policy approval,
+  guardrail blocks, tool errors, and reasoning-step limits. Use LLM-as-judge or
+  human review for natural-language final-answer groundedness, confusing
+  wording, and overpromising because free-form customer messages are hard to
+  parse reliably with code.
+- **After observing real traffic:** promote recurring judge failures into
+  golden cases. Add small structured outcomes or claims only for repeated,
+  high-risk categories, such as `refund_issued`, `refund_denied`,
+  `cancellation_completed`, `cancellation_denied`, `status_reported`,
+  `payment_dispute_escalated`, and `clarification_requested`.
+- **At scale:** expand structured outcomes for stable, high-volume flows so
+  deterministic LangSmith code evaluators can cover common cases cheaply. Keep
+  LLM-as-judge for sampled traces, edge cases, subtle answer quality, and judge
+  calibration.
 
 Future online evaluator shape:
 

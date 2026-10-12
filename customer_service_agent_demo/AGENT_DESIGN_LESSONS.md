@@ -94,6 +94,30 @@ Policy tools decide whether the action is allowed.
 Guardrails verify that the required decision exists before mutation.
 ```
 
+## Guardrail Blocks Should Change Control Flow
+
+A blocked tool call is not just another failed tool result. It is the graph
+saying, "this action should not execute under the current state." Treating that
+as ordinary tool output and then sending the agent back through the normal
+reasoning loop can create confusing behavior:
+
+- The deterministic planner may see `facts[tool_name]` and assume that step is
+  complete, even though the tool never ran.
+- An LLM planner may ignore the blocked result and request the same tool again.
+- The customer may receive a generic or inconsistent response instead of a clear
+  clarification, denial, escalation, or internal-error handling path.
+
+The safer lesson is that guardrail blocks should be explicit graph outcomes.
+Recoverable blocks can become customer-facing clarification prompts, such as
+"Which item was missing?" or "Please confirm the affected item." Unsafe or
+contract-violation blocks should stop the current loop, record the reason, and
+either return a policy-safe message or route to escalation/error handling.
+
+Blocked tool calls should also be stored separately from successful business
+facts. A blocked `issue_refund` result should not make the state look as if an
+`issue_refund` fact exists. Prefer a distinct field such as `guardrail_block`
+with the blocked tool name, reason code, and guardrail details.
+
 ## Refunds Are Risk Decisions, Not Truth Decisions
 
 A key lesson from refund automation is that deterministic code usually cannot
@@ -392,6 +416,57 @@ The division matters because evaluators that merely detect bad behavior after
 the response cannot protect money, orders, account state, or user trust. Any
 policy that must affect the current customer-visible action belongs in runtime
 policy tools or guardrails.
+
+## Prioritize Failures By Deployment Stage
+
+Not every evaluator failure deserves the same urgency. For a food-delivery
+support agent, prioritize by blast radius first, then user experience, then
+cost and operational polish.
+
+Before launch, fix failures that can wrongly change business state or materially
+mislead the customer:
+
+- Unsafe mutation, such as issuing a refund, cancelling an order, or creating a
+  duplicate mutation without the required policy decision and idempotency.
+- Final answers that are not grounded in tool results. Because the final answer
+  is natural language, use an LLM-as-judge or human review early for answer
+  groundedness, confusion, and overpromising.
+- Multi-intent requests that lead to mutating tools before the user clarifies
+  which request to handle.
+- Tool errors and guardrail blocks that make safe, common requests fail. These
+  are still best tracked with deterministic state and trace checks.
+
+Do not over-engineer a large claim taxonomy before real traffic. In early
+rollouts, combine deterministic evaluators for tool/state safety with
+LLM-as-judge evaluation for customer-facing prose. After traces show repeated
+answer failure patterns, add small structured outcomes or claims for the
+high-volume, high-risk cases only, such as `refund_issued`,
+`refund_denied`, `cancellation_completed`, `cancellation_denied`,
+`status_reported`, `payment_dispute_escalated`, and
+`clarification_requested`.
+
+During canary or early production, keep measuring the above and start watching
+for reliability and cost signals:
+
+- Slow runs, broken down by graph step, tool call, LLM call, and evaluator.
+- Too many reasoning steps, especially repeated tool calls or loops without new
+  information.
+- Wrong escalation team, if it affects SLA or causes repeated manual rerouting.
+
+In mature production, optimize the agent shape using patterns from real traces:
+
+- Remove repeated unnecessary read-only tool calls when they materially affect
+  latency or cost.
+- Split into route-specific flows only after evals show repeated confusion from
+  a shared prompt or broad tool surface.
+- Expand structured outcomes or claims once the domain flows are stable enough
+  that deterministic checks can replace judge calls for common cases.
+- Calibrate LLM-as-judge evaluators by reviewing false positives and false
+  negatives before using judge scores for release gates or dashboards.
+
+The sequencing rule is: prevent harm first, reduce user confusion second,
+improve reliability third, and optimize cost or latency once the basic behavior
+is safe and observable.
 
 ## Multi-Turn Conversations Need Thread-Level Evals
 
